@@ -5,12 +5,15 @@ import config
 import workstation_config_helpers
 import workstation_config_locators
 import loginout_helpers
+import deadline_helpers
 import squish
 
 import test
 
 
 def init():
+    # print deadline version being tested
+    deadline_helpers.print_deadline_version()
     # launch Deadline Workstation Config using deadline config gui command
     workstation_config_helpers.launch_deadline_config_gui()
     # using aws credential/non-DCM profile, set aws profile name to `(default)`

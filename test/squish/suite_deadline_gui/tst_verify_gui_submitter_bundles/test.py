@@ -7,12 +7,15 @@ import choose_jobbundledir_helpers
 import choose_jobbundledir_locators
 import gui_submitter_helpers
 import gui_submitter_locators
+import deadline_helpers
 import squish
 
 import test
 
 
 def init():
+    # print deadline version being tested
+    deadline_helpers.print_deadline_version()
     # launch Choose job bundle directory using deadline bundle gui-submit --browse command
     choose_jobbundledir_helpers.launch_jobbundle_dir()
     # verify Choose job bundle directory is open
