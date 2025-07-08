@@ -7,6 +7,7 @@ test = "pytest --cov-config pyproject.toml {args:test/unit}"
 test_docker = "./scripts/run_sudo_tests.sh --build"
 test_installer = "pytest --no-cov {args:test/installer} -vvv"
 test_build_installer = "pytest --no-cov {args:test/build_installer}"
+test_squish = "cd $HOME/tmp/squish/squish-for-qt-8.1.0/bin && ./squishrunner --testsuite {root}/test/squish/suite_deadline_gui --local"
 typing = "mypy {args:src test} --always-false=PYQT5 --always-false=PYSIDE2 --always-false=PYQT6 --always-true=PYSIDE6"
 style = ["ruff check {args:.}", "ruff format --check --diff {args:.}"]
 fmt = ["ruff format {args:.}", "style"]
