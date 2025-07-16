@@ -1,0 +1,25 @@
+name: Squish Tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  SquishLinuxTest:
+    name: Linux Squish Test
+    permissions:
+      id-token: write
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.SQUISH_ROLE }}
+          aws-region: us-west-2
+          mask-aws-account-id: true
+          role-duration-seconds: 7200
+      - name: Run Squish Tests
+        uses: aws-actions/aws-codebuild-run-build@v1
+        with:
+          project-name: deadline-cloud-SquishTests
+          hide-cloudwatch-logs: true
