@@ -17,7 +17,6 @@ jobs:
           role-to-assume: ${{ secrets.SQUISH_ROLE }}
           aws-region: us-west-2
           mask-aws-account-id: true
-          role-duration-seconds: 7200
       - name: Run Squish Tests
         uses: aws-actions/aws-codebuild-run-build@v1
         with:
