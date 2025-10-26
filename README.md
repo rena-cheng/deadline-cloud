@@ -15,6 +15,7 @@ Notable features include:
 * A library of functions that implement AWS Deadline Cloud's Job Attachments functionality.
 * A library of functions for creating a job submission UI within any content creation tool that supports Python 3.8+ based plugins and
   the Qt GUI framework.
+* A Model Context Protocol (MCP) server for AI assistant integration, enabling natural language interaction with AWS Deadline Cloud resources.
 
 [cas]: https://en.wikipedia.org/wiki/Content-addressable_storage
 [deadline-cloud]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/what-is-deadline-cloud.html
@@ -62,6 +63,11 @@ or if you want the optional gui dependencies:
 $ pip install "deadline[gui]"
 ```
 
+if you want the optional mcp dependencies:
+```sh
+$ pip install "deadline[mcp]"
+```
+
 ## Usage
 
 After installation it can then be used as a command line tool:
@@ -77,6 +83,18 @@ from deadline.client import api
 api.list_farms()
 # {'farms': [{'farmId': 'farm-1234567890abcdefg', 'displayName': 'my-first-farm', ...},]}
 ```
+
+The `deadlinew` command can be used from GUIs to avoid displaying a terminal window in the background when on Windows.
+You can use the `--redirect-output` option to write the terminal output to a file.
+```sh
+$ deadlinew --redirect-output out.txt farm list
+$ cat out.txt
+- farmId: farm-1234567890abcdefg
+  displayName: my-first-farm
+```
+
+An example usage is to create a shortcut called "Deadline Settings" on your desktop that runs `C:\path\to\deadlinew.exe config gui`.
+Opening the shortcut will show the Deadline Settings dialog without a terminal window behind it.
 
 ## Job-related Files
 For job-related files and data, AWS Deadline Cloud supports either transferring files to AWS using job attachments or reading files from network storage that is shared between both your local workstation and your farm.
@@ -103,8 +121,6 @@ Or with the configuration GUI:
 deadline config gui
 ```
 
-
-Shared storage is possible with customer-managed fleets (CMF) but not service-managed fleets (SMF). See [shared storage][shared-storage] for more information.
 
 ## Job Bundles
 
@@ -215,7 +231,7 @@ The command blocks until the job reaches a terminal state (SUCCEEDED, FAILED, CA
 - `2` - Job failed or has failed tasks
 - `3` - Job was canceled
 - `4` - Job was archived
-- `5` - Job is not compatible 
+- `5` - Job is not compatible
 
 ### Retrieving Job Logs
 
@@ -295,6 +311,25 @@ $ aws s3 ls --profile deadline-queue
 Available modes:
 - `USER`: Credentials with full queue-role permissions.
 - `READ`: Credentials with read-only permissions for queue logs
+
+## Model Context Protocol (MCP) Server
+
+The AWS Deadline Cloud client includes an MCP server that enables AI assistants to interact with AWS Deadline Cloud resources through natural language. The MCP server uses the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) for simplified tool registration while maintaining full protocol compliance.
+
+Example prompts:
+
+```
+- "List all my AWS Deadline Cloud farms"
+- "Show me the queues in my farm"
+- "List the jobs in my queue"
+- "Submit the render job in /path/to/my-job-bundle"
+- "Submit a job with priority 80 to my render queue"
+- "Show me the status of job job-3a907bac684841f69fc344867ee166de"
+- "Download output from job job-3a907bac684841f69fc344867ee166de"
+- "Download output from step step-render in job job-3a907bac684841f69fc344867ee166de"
+```
+
+See [MCP Guide](docs/mcp_guide.md) for more information.
 
 
 ## Code of Conduct

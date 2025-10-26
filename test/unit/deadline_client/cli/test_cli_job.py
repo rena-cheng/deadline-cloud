@@ -21,7 +21,11 @@ from dateutil.tz import tzutc  # type: ignore[import]
 from deadline.client import api, config
 from deadline.client.cli import main
 from deadline.client.cli._groups import job_group
-from deadline.client.cli._groups.job_group import _get_summary_of_files_to_download_message
+from deadline.client.cli._groups.job_group import (
+    _get_summary_of_files_to_download_message,
+    _get_json_line,
+    _get_download_summary_message,
+)
 from deadline.client.exceptions import DeadlineOperationError, DeadlineOperationTimedOut
 from deadline.job_attachments.models import (
     FileConflictResolution,
@@ -38,6 +42,9 @@ from ..shared_constants import (
     MOCK_FARM_ID,
     MOCK_JOB_ID,
     MOCK_QUEUE_ID,
+    MOCK_SESSION_ACTION_ID,
+    MOCK_STEP_ID,
+    MOCK_TASK_ID,
     MOCK_FLEET_ID,
     MOCK_WORKER_ID,
 )
@@ -417,6 +424,7 @@ def test_cli_job_download_output_stdout_with_only_required_input(
             job_id=MOCK_JOB_ID,
             step_id=None,
             task_id=None,
+            session_action_id=None,
             session=ANY,
         )
 
@@ -525,6 +533,7 @@ def test_cli_job_download_output_stdout_with_mismatching_path_format(
             job_id=MOCK_JOB_ID,
             step_id=None,
             task_id=None,
+            session_action_id=None,
             session=ANY,
         )
 
@@ -620,6 +629,7 @@ def test_cli_job_download_output_handles_unc_path_on_windows(fresh_deadline_conf
             job_id=MOCK_JOB_ID,
             step_id=None,
             task_id=None,
+            session_action_id=None,
             session=ANY,
         )
 
@@ -702,6 +712,7 @@ def test_cli_job_download_no_output_stdout(fresh_deadline_config, tmp_path: Path
             job_id=MOCK_JOB_ID,
             step_id=None,
             task_id=None,
+            session_action_id=None,
             session=ANY,
         )
 
@@ -793,6 +804,7 @@ def test_cli_job_download_output_stdout_with_json_format(
             job_id=MOCK_JOB_ID,
             step_id=None,
             task_id=None,
+            session_action_id=None,
             session=ANY,
         )
 
@@ -1352,6 +1364,10 @@ def test_cli_job_download_output_handle_web_url_with_optional_input(fresh_deadli
         }
         boto3_client_mock().get_queue.side_effect = [MOCK_GET_QUEUE_RESPONSE]
 
+        boto3_client_mock().get_task.return_value = {
+            "latestSessionActionId": MOCK_SESSION_ACTION_ID,
+        }
+
         runner = CliRunner()
         result = runner.invoke(
             main,
@@ -1378,6 +1394,7 @@ def test_cli_job_download_output_handle_web_url_with_optional_input(fresh_deadli
             job_id=MOCK_JOB_ID,
             step_id="step-1",
             task_id="task-2",
+            session_action_id=MOCK_SESSION_ACTION_ID,
             session=ANY,
         )
         mock_download.assert_called_once_with(
@@ -1469,7 +1486,7 @@ def test_cli_job_download_output_with_different_asset_root_path_format_than_job(
         job_group.os.path,
         "expanduser",
         return_value=tmp_path,
-    ) as mock_expanduser:
+    ) as mock_expanduser, patch.object(api._telemetry.TelemetryClient, "record_event", MagicMock()):
         mock_download = MagicMock()
         mock_download.return_value = DownloadSummaryStatistics(
             total_time=12,
@@ -1520,6 +1537,7 @@ def test_cli_job_download_output_with_different_asset_root_path_format_than_job(
             job_id=MOCK_JOB_ID,
             step_id=None,
             task_id=None,
+            session_action_id=None,
             session=ANY,
         )
 
@@ -1543,3 +1561,167 @@ You are about to download files which may come from multiple root directories. H
         assert "Download Summary:" in result.output
         assert result.exit_code == 0
         mock_expanduser.assert_any_call("~")
+
+
+class TestJsonLineHelpers:
+    """Tests for JSON line helper functions."""
+
+    def test_get_json_line_basic(self):
+        """Test _get_json_line with basic parameters."""
+        result = _get_json_line("test", "value")
+        parsed = json.loads(result)
+
+        assert parsed["messageType"] == "test"
+        assert parsed["value"] == "value"
+        assert len(parsed) == 2  # Only messageType and value
+
+    def test_get_json_line_with_none_extra_properties(self):
+        """Test _get_json_line with explicit None extra_properties."""
+        result = _get_json_line("test", "value", extra_properties=None)
+        parsed = json.loads(result)
+
+        assert parsed["messageType"] == "test"
+        assert parsed["value"] == "value"
+        assert len(parsed) == 2  # Only messageType and value
+
+    def test_get_json_line_with_kwargs(self):
+        """Test _get_json_line with additional properties."""
+        result = _get_json_line(
+            "summary", "Downloaded 5 files", extra_properties={"fileCount": 5, "status": "complete"}
+        )
+        parsed = json.loads(result)
+
+        assert parsed["messageType"] == "summary"
+        assert parsed["value"] == "Downloaded 5 files"
+        assert parsed["fileCount"] == 5
+        assert parsed["status"] == "complete"
+
+    def test_get_json_line_with_list_value(self):
+        """Test _get_json_line with list value and extra properties."""
+        result = _get_json_line("path", ["/path1", "/path2"], extra_properties={"count": 2})
+        parsed = json.loads(result)
+
+        assert parsed["messageType"] == "path"
+        assert parsed["value"] == ["/path1", "/path2"]
+        assert parsed["count"] == 2
+
+    def test_get_download_summary_message_json_with_file_count(self):
+        """Test _get_download_summary_message includes fileCount in JSON format."""
+        from deadline.job_attachments.progress_tracker import DownloadSummaryStatistics
+
+        # Create mock download summary
+        summary = DownloadSummaryStatistics()
+        summary.processed_files = 3
+        summary.processed_bytes = 1024
+        summary.total_time = 2.5
+        summary.transfer_rate = 409.6
+        summary.file_counts_by_root_directory = {"/downloads": 3}
+
+        result = _get_download_summary_message(summary, is_json_format=True)
+        parsed = json.loads(result)
+
+        assert parsed["messageType"] == "summary"
+        assert parsed["value"] == "Downloaded 3 files"
+        assert parsed["fileCount"] == 3
+
+    def test_get_download_summary_message_json_zero_files(self):
+        """Test _get_download_summary_message with zero files."""
+        from deadline.job_attachments.progress_tracker import DownloadSummaryStatistics
+
+        summary = DownloadSummaryStatistics()
+        summary.processed_files = 0
+
+        result = _get_download_summary_message(summary, is_json_format=True)
+        parsed = json.loads(result)
+
+        assert parsed["messageType"] == "summary"
+        assert parsed["value"] == "Downloaded 0 files"
+        assert parsed["fileCount"] == 0
+
+    def test_get_download_summary_message_non_json_unchanged(self):
+        """Test _get_download_summary_message non-JSON format is unchanged."""
+        from deadline.job_attachments.progress_tracker import DownloadSummaryStatistics
+
+        summary = DownloadSummaryStatistics()
+        summary.processed_files = 2
+        summary.processed_bytes = 512
+        summary.total_time = 1.0
+        summary.transfer_rate = 512.0
+        summary.file_counts_by_root_directory = {"/downloads": 2}
+
+        result = _get_download_summary_message(summary, is_json_format=False)
+
+        # Should be human-readable format, not JSON
+        assert "Download Summary:" in result
+        assert "Downloaded 2 files totaling" in result
+        assert not result.startswith('{"messageType":')
+
+
+def test_cli_job_download_output_with_session_action_id(fresh_deadline_config):
+    config.set_setting("settings.auto_accept", "true")
+
+    with patch.object(api, "get_boto3_client") as boto3_client_mock, patch.object(
+        job_group, "OutputDownloader"
+    ) as MockOutputDownloader, patch.object(
+        job_group, "_get_conflicting_filenames", return_value=[]
+    ), patch.object(job_group, "round", return_value=0), patch.object(
+        api, "get_queue_user_boto3_session"
+    ):
+        mock_download = MagicMock()
+        mock_download.return_value = DownloadSummaryStatistics(
+            total_time=12,
+            processed_files=3,
+            processed_bytes=1024,
+        )
+        MockOutputDownloader.return_value.download_job_output = mock_download
+        MockOutputDownloader.return_value.get_output_paths_by_root.return_value = {}
+
+        mock_host_path_format_name = PathFormat.get_host_path_format_string()
+        boto3_client_mock().get_job.return_value = {
+            "name": "Test Job",
+            "attachments": {
+                "manifests": [
+                    {
+                        "rootPath": "/root/path",
+                        "rootPathFormat": PathFormat(mock_host_path_format_name),
+                        "outputRelativeDirectories": ["."],
+                    },
+                ],
+            },
+        }
+        boto3_client_mock().get_step.return_value = {"name": "Test Step"}
+        boto3_client_mock().get_task.return_value = {
+            "latestSessionActionId": MOCK_SESSION_ACTION_ID,
+        }
+        boto3_client_mock().get_queue.return_value = MOCK_GET_QUEUE_RESPONSE
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "job",
+                "download-output",
+                "--farm-id",
+                MOCK_FARM_ID,
+                "--queue-id",
+                MOCK_QUEUE_ID,
+                "--job-id",
+                MOCK_JOB_ID,
+                "--step-id",
+                MOCK_STEP_ID,
+                "--task-id",
+                MOCK_TASK_ID,
+            ],
+        )
+
+        assert result.exit_code == 0, f"CLI failed with output: {result.output}"
+        MockOutputDownloader.assert_called_once_with(
+            s3_settings=ANY,
+            farm_id=MOCK_FARM_ID,
+            queue_id=MOCK_QUEUE_ID,
+            job_id=MOCK_JOB_ID,
+            step_id=MOCK_STEP_ID,
+            task_id=MOCK_TASK_ID,
+            session_action_id=MOCK_SESSION_ACTION_ID,
+            session=ANY,
+        )

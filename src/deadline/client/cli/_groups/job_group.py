@@ -10,6 +10,7 @@ import logging
 from configparser import ConfigParser
 from pathlib import Path
 import os
+import re
 import sys
 from typing import Callable, Optional, Union
 import datetime
@@ -19,22 +20,22 @@ import textwrap
 import click
 from botocore.exceptions import ClientError
 
-from deadline.client.api._session import _modified_logging_level
-from deadline.job_attachments.download import OutputDownloader
-from deadline.job_attachments.models import (
+from ...api._session import _modified_logging_level
+from ....job_attachments.download import OutputDownloader
+from ....job_attachments.models import (
     FileConflictResolution,
     JobAttachmentS3Settings,
     PathFormat,
 )
-from deadline.job_attachments._utils import (
+from ....job_attachments._utils import (
     WINDOWS_MAX_PATH_LENGTH,
     _is_windows_long_path_registry_enabled,
 )
-from deadline.job_attachments.progress_tracker import (
+from ....job_attachments.progress_tracker import (
     DownloadSummaryStatistics,
     ProgressReportMetadata,
 )
-from deadline.job_attachments._path_summarization import (
+from ....job_attachments._path_summarization import (
     human_readable_file_size,
     summarize_path_list,
 )
@@ -43,7 +44,9 @@ from ... import api
 from ...config import config_file
 from ...exceptions import DeadlineOperationError, DeadlineOperationTimedOut
 from .._common import _apply_cli_options_to_config, _cli_object_repr, _handle_error
+from .._main import deadline as main
 from ._sigint_handler import SigIntHandler
+from ...api._session import get_default_client_config
 
 logger = logging.getLogger("deadline.client.cli")
 
@@ -82,15 +85,52 @@ def _format_timestamp(timestamp: datetime.datetime, use_local_time: bool = False
         return utc_timestamp.isoformat()
 
 
+def _parse_session_action_id(session_action_id: str) -> str:
+    """
+    Parse a session action ID and extract the session ID.
+
+    Session action ID format: sessionaction-{uuid}-{number}
+    Session ID format: session-{uuid}
+
+    Args:
+        session_action_id: The session action ID to parse
+
+    Returns:
+        The derived session ID
+
+    Raises:
+        DeadlineOperationError: If the session action ID format is invalid
+    """
+    pattern = r"^sessionaction-([0-9a-f]{32})-\d+$"
+    match = re.match(pattern, session_action_id)
+
+    if not match:
+        raise DeadlineOperationError(
+            f"Invalid session action ID format: '{session_action_id}'. "
+            f"Expected format: sessionaction-{{uuid}}-{{number}}"
+        )
+
+    uuid = match.group(1)
+    session_id = f"session-{uuid}"
+
+    return session_id
+
+
 # Set up the signal handler for handling Ctrl + C interruptions.
 sigint_handler = SigIntHandler()
 
 
-@click.group(name="job")
+@main.group(name="job")
 @_handle_error
 def cli_job():
     """
-    Commands to work with jobs.
+    Commands to work with [Deadline Cloud jobs] in a [queue].
+
+    Use the `deadline bundle submit` or `deadline bundle gui-submit` commands to create a job
+    from a job bundle.
+
+    [Deadline Cloud jobs]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/deadline-cloud-jobs.html
+    [queue]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/queues.html
     """
 
 
@@ -103,7 +143,9 @@ def cli_job():
 @_handle_error
 def job_list(page_size, item_offset, **args):
     """
-    Lists the Jobs in a queue.
+    Lists the [Deadline Cloud jobs] in the queue.
+
+    [Deadline Cloud jobs]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/deadline-cloud-jobs.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(required_options={"farm_id", "queue_id"}, **args)
@@ -160,7 +202,9 @@ def job_list(page_size, item_offset, **args):
 @_handle_error
 def job_get(**args):
     """
-    Get the details of a job.
+    Get the details of a [Deadline Cloud job] in the queue.
+
+    [Deadline Cloud job]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/deadline-cloud-jobs.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(
@@ -185,19 +229,22 @@ def job_get(**args):
 @click.option("--job-id", help="The job to cancel.")
 @click.option(
     "--mark-as",
-    type=click.Choice(["CANCELED", "FAILED", "SUCCEEDED"], case_sensitive=False),
+    type=click.Choice(["SUSPENDED", "CANCELED", "FAILED", "SUCCEEDED"], case_sensitive=False),
     default="CANCELED",
     help="The status to apply to all active tasks in the job.",
 )
 @click.option(
     "--yes",
     is_flag=True,
-    help="Skip any confirmation prompts",
+    help="Automatically accept any confirmation prompts",
 )
 @_handle_error
 def job_cancel(mark_as: str, yes: bool, **args):
     """
-    Cancel job from running.
+    Cancel a [Deadline Cloud job] from running, optionally marking it with an alternative status such
+    as SUSPENDED, SUCCEEDED or FAILED.
+
+    [Deadline Cloud job]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/deadline-cloud-jobs.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(
@@ -260,6 +307,160 @@ def job_cancel(mark_as: str, yes: bool, **args):
     deadline.update_job(farmId=farm_id, queueId=queue_id, jobId=job_id, targetTaskRunStatus=mark_as)
 
 
+@cli_job.command(name="requeue-tasks")
+@click.option("--profile", help="The AWS profile to use.")
+@click.option("--farm-id", help="The farm to use.")
+@click.option("--queue-id", help="The queue to use.")
+@click.option("--job-id", help="The job to requeue tasks for.")
+@click.option(
+    "--run-status",
+    type=click.Choice(
+        ["SUSPENDED", "CANCELED", "FAILED", "SUCCEEDED", "NOT_COMPATIBLE"], case_sensitive=False
+    ),
+    multiple=True,
+    help="Requeue tasks of this status. Repeat the option to provide multiple statuses.",
+)
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Automatically accept any confirmation prompts",
+)
+@_handle_error
+def job_requeue_tasks(run_status: Optional[list[str]], **args):
+    """
+    Requeue tasks of a [Deadline Cloud job]. By default, requeues all FAILED, CANCELED, and SUSPENDED tasks.
+
+    Use the --run-status option to requeue tasks of different status.
+
+    [Deadline Cloud job]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/deadline-cloud-jobs.html
+    """
+    # Get a temporary config object with the standard options handled
+    config = _apply_cli_options_to_config(
+        required_options={"farm_id", "queue_id", "job_id"}, **args
+    )
+
+    farm_id = config_file.get_setting("defaults.farm_id", config=config)
+    queue_id = config_file.get_setting("defaults.queue_id", config=config)
+    job_id = config_file.get_setting("defaults.job_id", config=config)
+
+    if not run_status:
+        run_status_set = {"SUSPENDED", "CANCELED", "FAILED"}
+    else:
+        run_status_set = {status.upper() for status in run_status}
+
+    session = api.get_boto3_session(config=config)
+    deadline_client = api.get_boto3_client("deadline", config=config)
+
+    # Create a separate API client for the update_task calls, using the "adaptive" retry strategy.
+    # This strategy is better suited to repeatedly calling the API for a longer duration, because it
+    # retains backoff data across calls instead of starting fresh each time.
+    requeues_client_config = get_default_client_config(
+        retries=dict(mode="adaptive", total_max_attempts=5)
+    )
+    deadline_client_for_requeues = session.client("deadline", config=requeues_client_config)
+
+    # Print a summary of the job's task run statuses
+    job = deadline_client.get_job(farmId=farm_id, queueId=queue_id, jobId=job_id)
+
+    click.echo(f"Job: {job['name']} ({job['jobId']})")
+    # Remove the zero-count status counts for a shorter summary
+    task_run_status_counts = {
+        name.upper(): count for name, count in job["taskRunStatusCounts"].items() if count != 0
+    }
+    click.echo(_cli_object_repr({"taskRunStatusCounts": task_run_status_counts}))
+    click.echo(f"Requeuing all tasks with run status among: {', '.join(sorted(run_status_set))}")
+
+    total_task_count_to_requeue = sum(
+        count for name, count in task_run_status_counts.items() if name in run_status_set
+    )
+    summary_task_count_by_status = ", ".join(
+        f"{count} {name} tasks"
+        for name, count in task_run_status_counts.items()
+        if name in run_status_set and count != 0
+    )
+    summary_tasks_message = f"{total_task_count_to_requeue} total tasks"
+
+    if total_task_count_to_requeue == 0:
+        click.echo("No tasks to requeue.")
+        return
+
+    # Ask for confirmation about requeuing the selected tasks
+    if config_file.str2bool(config_file.get_setting("settings.auto_accept", config=config)):
+        click.echo(
+            f"Estimated {summary_tasks_message} ({summary_task_count_by_status}) to requeue."
+        )
+    else:
+        click.echo(
+            f"This action will requeue an estimated {summary_tasks_message} ({summary_task_count_by_status})"
+        )
+        if not click.confirm(
+            "Are you sure you want to requeue these tasks?",
+            default=None,
+        ):
+            click.echo("No tasks were requeued.")
+            sys.exit(1)
+        click.echo("Requeuing tasks...")
+
+    total_count_requeued = 0
+    # Use a paginator to get all the steps
+    paginator = deadline_client.get_paginator("list_steps")
+    steps = []
+    for page in paginator.paginate(farmId=farm_id, queueId=queue_id, jobId=job_id):
+        steps.extend(page["steps"])
+
+    # For each step, requeue all the tasks matching the run statuses
+    for step in steps:
+        click.echo(f"\nStep: {step['name']} ({step['stepId']})")
+        step_task_count_to_requeue = sum(
+            count for name, count in step["taskRunStatusCounts"].items() if name in run_status_set
+        )
+        summary_task_count_by_status = ", ".join(
+            f"{count} {name} tasks"
+            for name, count in step["taskRunStatusCounts"].items()
+            if name in run_status_set and count != 0
+        )
+        summary_tasks_message = f"{step_task_count_to_requeue} total tasks"
+        if step_task_count_to_requeue == 0:
+            click.echo("  Step has no tasks to requeue.")
+            continue
+        else:
+            click.echo(
+                f"  Requeuing an estimated {summary_tasks_message} ({summary_task_count_by_status})..."
+            )
+
+        paginator = deadline_client.get_paginator("list_tasks")
+        for page in paginator.paginate(
+            farmId=farm_id, queueId=queue_id, jobId=job_id, stepId=step["stepId"]
+        ):
+            for task in page["tasks"]:
+                if task["runStatus"].upper() in run_status_set:
+                    parameters = task.get("parameters", {})
+                    if parameters:
+                        task_summary = (
+                            ",".join(
+                                f"{param}={list(parameters[param].values())[0]}"
+                                for param in parameters
+                            )
+                            + f" ({task['taskId']})"
+                        )
+                    else:
+                        task_summary = task["taskId"]
+                    click.echo(f"    {task['runStatus']} {task_summary}")
+                    # Requeue means to set the target run status to PENDING. If a task has no dependencies,
+                    # it will switch to READY immediately.
+                    deadline_client_for_requeues.update_task(
+                        farmId=farm_id,
+                        queueId=queue_id,
+                        jobId=job_id,
+                        stepId=step["stepId"],
+                        taskId=task["taskId"],
+                        targetRunStatus="PENDING",
+                    )
+                    total_count_requeued += 1
+
+    click.echo(f"\nRequeued a total of {total_count_requeued} tasks.")
+
+
 def _download_job_output(
     config: Optional[ConfigParser],
     farm_id: str,
@@ -282,6 +483,7 @@ def _download_job_output(
     job = deadline.get_job(farmId=farm_id, queueId=queue_id, jobId=job_id)
     step = {}
     task = {}
+    session_action_id = None
     if step_id:
         step = deadline.get_step(farmId=farm_id, queueId=queue_id, jobId=job_id, stepId=step_id)
     if task_id:
@@ -292,6 +494,7 @@ def _download_job_output(
             stepId=step_id,
             taskId=task_id,
         )
+        session_action_id = task.get("latestSessionActionId")
 
     click.echo(
         _get_start_message(job["name"], step.get("name"), task.get("parameters"), is_json_format)
@@ -322,6 +525,7 @@ def _download_job_output(
         job_id=job_id,
         step_id=step_id,
         task_id=task_id,
+        session_action_id=session_action_id,
         session=queue_role_session,
     )
 
@@ -468,7 +672,7 @@ def _download_job_output(
     # makes it keep logging urllib3 warning messages when downloading large files)
     with _modified_logging_level(logging.getLogger("urllib3"), logging.ERROR):
 
-        @api.record_success_fail_telemetry_event(metric_name="download_job_output")  # type: ignore
+        @api.record_success_fail_telemetry_event(metric_name="download_job_output")
         def _download_job_output(
             file_conflict_resolution: Optional[
                 FileConflictResolution
@@ -609,6 +813,7 @@ def _get_download_summary_message(
         return _get_json_line(
             JSON_MSG_TYPE_SUMMARY,
             f"Downloaded {download_summary.processed_files} files",
+            extra_properties={"fileCount": download_summary.processed_files},
         )
     else:
         paths_joined = "\n        ".join(
@@ -649,8 +854,15 @@ def _get_conflicting_filenames(filenames_by_root: dict[str, list[str]]) -> list[
     return conflicting_filenames
 
 
-def _get_json_line(messageType: str, value: Union[str, list[str], dict[str, Any]]) -> str:
-    return json.dumps({"messageType": messageType, "value": value}, ensure_ascii=True)
+def _get_json_line(
+    messageType: str,
+    value: Union[str, list[str], dict[str, Any]],
+    extra_properties: Optional[dict[str, Any]] = None,
+) -> str:
+    json_obj = {"messageType": messageType, "value": value}
+    if extra_properties:
+        json_obj.update(extra_properties)
+    return json.dumps(json_obj, ensure_ascii=True)
 
 
 def _get_value_from_json_line(
@@ -706,7 +918,7 @@ def _assert_valid_path(path: str) -> None:
 @click.option(
     "--yes",
     is_flag=True,
-    help="Skip any confirmation prompts",
+    help="Automatically accept any confirmation prompts",
 )
 @click.option(
     "--output",
@@ -722,7 +934,10 @@ def _assert_valid_path(path: str) -> None:
 @_handle_error
 def job_download_output(step_id, task_id, output, **args):
     """
-    Download a job's output.
+    Download a the output of a [Deadline Cloud job] in the queue that was saved as [job attachments].
+
+    [Deadline Cloud job]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/deadline-cloud-jobs.html
+    [job attachments]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/storage-job-attachments.html
     """
     if task_id and not step_id:
         raise click.UsageError("Missing option '--step-id' required with '--task-id'")
@@ -765,21 +980,26 @@ def job_download_output(step_id, task_id, output, **args):
 @_handle_error
 def job_wait_for_completion(max_poll_interval, timeout, output, **args):
     """
-    Wait for a job to complete and return failed step-task IDs.
+    Wait for a [Deadline Cloud job] to complete and then print information about failed step-task IDs.
 
-    This command blocks until the job's taskRunStatus reaches a terminal state (SUCCEEDED, FAILED, CANCELED, SUSPENDED, or NOT_COMPATIBLE),
-    then returns a list of any failed step-task combinations.
+    This command blocks until the job's taskRunStatus reaches a terminal state
+    (SUCCEEDED, FAILED, CANCELED, SUSPENDED, or NOT_COMPATIBLE),
+    then prints a list of any failed step-task combinations.
 
     The command uses exponential backoff for polling, starting at 0.5 seconds and doubling
     the interval after each check until it reaches the maximum polling interval.
 
     Exit codes:
-    0 - Job succeeded
-    1 - Timeout waiting for job completion
-    2 - Job failed (any tasks failed)
-    3 - Job was canceled
-    4 - Job was suspended
-    5 - Job is not compatible
+
+    \b
+        0 - Job succeeded
+        1 - Timeout waiting for job completion
+        2 - Job failed (any tasks failed)
+        3 - Job was canceled
+        4 - Job was suspended
+        5 - Job is not compatible
+
+    [Deadline Cloud job]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/deadline-cloud-jobs.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(
@@ -798,7 +1018,7 @@ def job_wait_for_completion(max_poll_interval, timeout, output, **args):
     job_name = job["name"]
 
     # Define a status callback for verbose output
-    def status_callback(status, elapsed_time=0, total_timeout=0):
+    def job_callback(job, elapsed_time=0, total_timeout=0):
         if not is_json_output:
             timeout_info = ""
             if total_timeout > 0:
@@ -808,13 +1028,21 @@ def job_wait_for_completion(max_poll_interval, timeout, output, **args):
                 timeout_info = f" [{elapsed_time:.1f}s elapsed]"
 
             # Clear the current line and update in place
+            current_worker_count = (
+                job["taskRunStatusCounts"].get("RUNNING", 0)
+                + job["taskRunStatusCounts"].get("ASSIGNED", 0)
+                + job["taskRunStatusCounts"].get("STARTING", 0)
+            )
+            completed_task_count = job["taskRunStatusCounts"].get("SUCCEEDED", 0)
+            total_task_count = sum(job["taskRunStatusCounts"].values())
             click.echo(
-                f"\rCurrent status: {status}.{timeout_info}",
+                f"\rCurrent status: {job.get('taskRunStatus', '')} ({completed_task_count}/{total_task_count} tasks succeeded, {current_worker_count} workers running).{timeout_info}",
                 nl=False,
             )
 
     if not is_json_output:
         click.echo(f"Waiting for job {job_id} to complete...")
+        click.echo(f"Job Name: {job_name}")
 
     try:
         result = api.wait_for_job_completion(
@@ -824,7 +1052,7 @@ def job_wait_for_completion(max_poll_interval, timeout, output, **args):
             max_poll_interval=max_poll_interval,
             timeout=timeout,
             config=config,
-            status_callback=status_callback,
+            job_callback=job_callback,
         )
 
         if is_json_output:
@@ -848,7 +1076,6 @@ def job_wait_for_completion(max_poll_interval, timeout, output, **args):
         else:
             # Use verbose output with YAML formatting
             click.echo(f"Job ID: {job_id}")
-            click.echo(f"Job Name: {job_name}")
             click.echo(f"Job completed with status: {result.status}")
             click.echo(f"Elapsed time: {result.elapsed_time:.1f} seconds")
 
@@ -925,6 +1152,10 @@ def job_wait_for_completion(max_poll_interval, timeout, output, **args):
     "--session-id",
     help="The session ID to get logs for. If not provided and job-id is specified, will use the latest session based on endedAt time.",
 )
+@click.option(
+    "--session-action-id",
+    help="The session action ID to get logs for. The session ID will be derived from this.",
+)
 @click.option("--limit", default=100, help="Maximum number of log lines to return.")
 @click.option(
     "--start-time",
@@ -945,11 +1176,13 @@ def job_wait_for_completion(max_poll_interval, timeout, output, **args):
     help="Timezone for timestamps (utc or local). Default is utc.",
 )
 @_handle_error
-def job_logs(session_id, limit, start_time, end_time, next_token, output, timezone, **args):
+def job_logs(
+    session_id, session_action_id, limit, start_time, end_time, next_token, output, timezone, **args
+):
     """
-    Get CloudWatch logs for a specific session.
+    Prints a [Deadline Cloud session log] stored in [CloudWatch logs] for the job.
+    Defaults to a recent/ongoing session if a session id is not provided.
 
-    This command retrieves logs from CloudWatch for the specified session ID.
     By default, it returns the most recent 100 log lines, but this can be
     adjusted using the --limit parameter.
 
@@ -959,7 +1192,11 @@ def job_logs(session_id, limit, start_time, end_time, next_token, output, timezo
     2. Among ongoing sessions, select the one that started most recently
     3. If no ongoing sessions exist, select the completed session that ended most recently
 
-    Use --next-token with the value from a previous response to get the next page of results.
+    Use --next-token with the value from a previous response to get the next page of results
+    of log output prior to the last page.
+
+    [Deadline Cloud session log]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/view-logs.html
+    [CloudWatch logs]: https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/monitoring-cloudwatch.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(required_options={"farm_id", "queue_id"}, **args)
@@ -969,6 +1206,22 @@ def job_logs(session_id, limit, start_time, end_time, next_token, output, timezo
     job_id = config_file.get_setting("defaults.job_id", config=config)
 
     is_json_output = output.lower() == "json"
+
+    # Handle session action ID if provided
+    if session_action_id:
+        # Parse session action ID to derive session ID
+        derived_session_id = _parse_session_action_id(session_action_id)
+
+        # If both session_id and session_action_id are provided, validate consistency
+        if session_id:
+            if session_id != derived_session_id:
+                raise DeadlineOperationError(
+                    f"Session ID mismatch: --session-id '{session_id}' does not match "
+                    f"session ID '{derived_session_id}' derived from --session-action-id '{session_action_id}'"
+                )
+        else:
+            # If only session_action_id is provided, set session_id from parsed value
+            session_id = derived_session_id
 
     # Get job name if job_id is available
     deadline = api.get_boto3_client("deadline", config=config)
@@ -1032,10 +1285,91 @@ def job_logs(session_id, limit, start_time, end_time, next_token, output, timezo
             "Session ID is required. Provide it with --session-id or specify a --job-id with at least one session."
         )
 
+    if session_action_id:
+        log_entity = f"session action {session_action_id}"
+    else:
+        log_entity = f"session {session_id}"
+
     if not is_json_output:
         click.echo(
-            f"Retrieving logs for session {session_id} from log group /aws/deadline/{farm_id}/{queue_id}..."
+            f"Retrieving logs for {log_entity} from log group /aws/deadline/{farm_id}/{queue_id}..."
         )
+        # Display job information if available
+        click.echo(f"Job ID: {job_id}")
+        click.echo(f"Job Name: {job_name}")
+
+    # If session_action_id is provided, retrieve session action details to get timestamp range
+    if session_action_id:
+        try:
+            session_action = deadline.get_session_action(
+                farmId=farm_id,
+                queueId=queue_id,
+                jobId=job_id,
+                sessionActionId=session_action_id,
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                raise DeadlineOperationError(
+                    f"Session action '{session_action_id}' not found in job '{job_id}'"
+                ) from exc
+            else:
+                raise DeadlineOperationError(
+                    f"Failed to retrieve session action '{session_action_id}':\n{exc}"
+                ) from exc
+
+        # Extract timestamps from session action
+        action_start = session_action.get("startedAt")
+        action_end = session_action.get("endedAt")
+
+        # If session action hasn't started yet, raise an error
+        if not action_start:
+            raise DeadlineOperationError(
+                f"Session action '{session_action_id}' has not started yet. No logs are available."
+            )
+
+        if not is_json_output:
+            click.echo(f"Session action start: {action_start}")
+        if action_end:
+            if not is_json_output:
+                click.echo(f"Session action end: {action_end}")
+        else:
+            if not is_json_output:
+                click.echo("Session action is still running")
+            # If session action is still in progress, use current time as end time
+            action_end = datetime.datetime.now(datetime.timezone.utc)
+        if not is_json_output:
+            click.echo(f"Session action duration: {action_end - action_start}")
+
+        # Get the effective time range to process, which is the intersection of
+        # the session action time range and the user-provided time range
+        if start_time:
+            # Parse user's start_time
+            user_start = datetime.datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            # Use the later of the two start times
+            effective_start = max(user_start, action_start)
+        else:
+            effective_start = action_start
+
+        if end_time:
+            # Parse user's end_time
+            user_end = datetime.datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            # Use the earlier of the two end times
+            effective_end = min(user_end, action_end)
+        else:
+            effective_end = action_end
+
+        # Validate that effective_start <= effective_end
+        if effective_start > effective_end:
+            error_msg = (
+                f"The specified time range does not overlap with the session action's time range.\n"
+                f"Session action time range: {action_start.isoformat()} to {action_end.isoformat()}"
+            )
+            error_msg += f"\nSpecified time range: {start_time or 'N/A'} to {end_time or 'N/A'}"
+            raise DeadlineOperationError(error_msg)
+
+        # Use the combined timestamps for log retrieval
+        start_time = effective_start
+        end_time = effective_end
 
     try:
         result = api.get_session_logs(
@@ -1074,14 +1408,13 @@ def job_logs(session_id, limit, start_time, end_time, next_token, output, timezo
             }
             click.echo(json.dumps(response, indent=2))
         else:
+            # Separate the logs by a blank line to make the start of the log easy to find.
+            click.echo()
+
             # Display the logs in verbose format
             if not result.events:
                 click.echo("No logs found for the specified session.")
                 return
-
-            # Display job information if available
-            click.echo(f"Job ID: {job_id}")
-            click.echo(f"Job Name: {job_name}")
 
             for event in result.events:
                 timestamp = _format_timestamp(event.timestamp, use_local_time)
@@ -1122,11 +1455,13 @@ def job_logs(session_id, limit, start_time, end_time, next_token, output, timezo
 @_handle_error
 def job_trace_schedule(verbose, trace_format, trace_file, **args):
     """
-    EXPERIMENTAL - Generate statistics from a job.
+    EXPERIMENTAL - Generate statistics from a job with a trace that you can view and explore interactively.
 
     To visualize the trace output file when providing the options
-    "--trace-format chrome --trace-file <output>.json", use
-    the https://ui.perfetto.dev Tracing UI and choose "Open trace file".
+    "--trace-format chrome --trace-file output.json", open
+    the [Perfetto Tracing UI] in a browser and choose "Open trace file".
+
+    [Perfetto Tracing UI]: https://ui.perfetto.dev
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(

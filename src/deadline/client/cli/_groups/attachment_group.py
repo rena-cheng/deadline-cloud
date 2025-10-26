@@ -10,32 +10,36 @@ from __future__ import annotations
 
 import click
 import boto3
-
+from dataclasses import asdict
 from typing import Optional
 
 from .click_logger import ClickLogger
 from .._common import _apply_cli_options_to_config, _handle_error
 from ...config import config_file
+from .._main import deadline as main
 
-from deadline.client import api
-from deadline.job_attachments import api as attachment_api
-from deadline.job_attachments._aws.deadline import get_queue
-from deadline.job_attachments.exceptions import MissingJobAttachmentSettingsError
-from deadline.job_attachments.models import FileConflictResolution, JobAttachmentS3Settings
+from ... import api
+from ....job_attachments.api.attachment import (
+    _attachment_download,
+    _attachment_upload,
+)
+from ....job_attachments._aws.deadline import get_queue
+from ....job_attachments.exceptions import MissingJobAttachmentSettingsError
+from ....job_attachments.models import FileConflictResolution, JobAttachmentS3Settings
+from ....job_attachments.progress_tracker import DownloadSummaryStatistics
 
 
-@click.group(name="attachment")
+@main.group(name="attachment")
 @_handle_error
 def cli_attachment():
     """
-    Commands to work with Deadline Cloud Job Attachments.
+    BETA - Commands to work with [Deadline Cloud job attachments].
+
+    [Deadline Cloud job attachments]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/storage-job-attachments.html
     """
 
 
-@cli_attachment.command(
-    name="download",
-    help="BETA - Download Job Attachment data files for given manifest(s).",
-)
+@cli_attachment.command(name="download")
 @click.option(
     "-m",
     "--manifests",
@@ -77,7 +81,9 @@ def attachment_download(
     **args,
 ):
     """
-    Download data files of manifest root(s) to a machine for given manifest(s) from S3.
+    BETA - Download Job Attachment data files for given [job attachments] manifest(s).
+
+    [job attachments]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/storage-job-attachments.html
     """
     logger: ClickLogger = ClickLogger(is_json=json)
 
@@ -85,7 +91,7 @@ def attachment_download(
     config = _apply_cli_options_to_config(**args)
 
     # Assuming when passing with config, session constructs from the profile id for S3 calls
-    # TODO - add type for profile, if queue type, get queue sesson directly
+    # TODO - add type for profile, if queue type, get queue session directly
     boto3_session: boto3.session = api.get_boto3_session(config=config)
 
     # If profile is not provided via args, default to use local config file
@@ -120,20 +126,20 @@ def attachment_download(
     ):
         conflict_resolution = FileConflictResolution[conflict_resolution_setting]
 
-    attachment_api.attachment_download(
+    download_summary: DownloadSummaryStatistics = _attachment_download(
         manifests=manifests,
         s3_root_uri=s3_root_uri,
         boto3_session=boto3_session,
         path_mapping_rules=path_mapping_rules,
-        logger=logger,
+        print_function_callback=logger.echo,
         conflict_resolution=conflict_resolution,
     )
 
+    logger.echo(download_summary)
+    logger.json(asdict(download_summary.convert_to_summary_statistics()))
 
-@cli_attachment.command(
-    name="upload",
-    help="BETA - Upload Job Attachment data files for given manifest(s).",
-)
+
+@cli_attachment.command(name="upload")
 @click.option(
     "-m",
     "--manifests",
@@ -171,7 +177,9 @@ def attachment_upload(
     **args,
 ):
     """
-    Upload output files to s3. The files always include data files, optionally upload manifests prefixed by given path.
+    BETA - Upload Job Attachment data files for given [job attachments] manifest(s).
+
+    [job attachments]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/storage-job-attachments.html
     """
     logger: ClickLogger = ClickLogger(is_json=json)
 
@@ -179,7 +187,7 @@ def attachment_upload(
     config = _apply_cli_options_to_config(**args)
 
     # Assuming when passing with config, session constructs from the profile id for S3 calls
-    # TODO - add type for profile, if queue type, get queue sesson directly
+    # TODO - add type for profile, if queue type, get queue session directly
     boto3_session: boto3.session = api.get_boto3_session(config=config)
 
     # If profile is not provided via args, default to use local config file
@@ -203,12 +211,12 @@ def attachment_upload(
     if not s3_root_uri:
         raise MissingJobAttachmentSettingsError("No valid s3 root path available")
 
-    attachment_api.attachment_upload(
+    _attachment_upload(
         root_dirs=root_dirs,
         manifests=manifests,
         s3_root_uri=s3_root_uri,
         boto3_session=boto3_session,
         path_mapping_rules=path_mapping_rules,
         upload_manifest_path=upload_manifest_path,
-        logger=logger,
+        print_function_callback=logger.echo,
     )

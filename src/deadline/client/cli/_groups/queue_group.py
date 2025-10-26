@@ -8,6 +8,7 @@ import click
 import json
 import time
 import os
+import sys
 from configparser import ConfigParser
 from typing import Optional
 import boto3
@@ -15,6 +16,7 @@ from botocore.exceptions import ClientError  # type: ignore[import]
 from datetime import datetime, timedelta, timezone
 
 from ... import api
+from ...api._session import get_session_client
 from ...config import config_file
 from ...exceptions import DeadlineOperationError
 from .._common import _apply_cli_options_to_config, _cli_object_repr, _handle_error
@@ -22,21 +24,23 @@ from ....job_attachments.models import (
     FileConflictResolution,
 )
 from .click_logger import ClickLogger
+from .._main import deadline as main
 from .._incremental_download import _incremental_output_download
 from .._pid_file_lock import PidFileLock
 from ....job_attachments._incremental_downloads.incremental_download_state import (
     IncrementalDownloadState,
 )
 
-PID_FILE_NAME = "incremental_output_download.pid"
 DOWNLOAD_CHECKPOINT_FILE_NAME = "download_checkpoint.json"
 
 
-@click.group(name="queue")
+@main.group(name="queue")
 @_handle_error
 def cli_queue():
     """
-    Commands for queues.
+    Commands to work with [Deadline Cloud queues].
+
+    [Deadline Cloud queues]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/queues.html
     """
 
 
@@ -46,7 +50,12 @@ def cli_queue():
 @_handle_error
 def queue_list(**args):
     """
-    Lists the available queues.
+    Lists the available [Deadline Cloud queues] in the farm. If the AWS profile is created
+    from a [Deadline Cloud monitor] login, it will list the queues you have permission to access,
+    otherwise it will list all queues.
+
+    [Deadline Cloud queues]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/queues.html
+    [Deadline Cloud monitor]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/working-with-deadline-monitor.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(required_options={"farm_id"}, **args)
@@ -86,7 +95,15 @@ def queue_list(**args):
 @_handle_error
 def queue_export_credentials(mode, output_format, **args):
     """
-    Export queue credentials in a format compatible with AWS SDK credentials_process.
+    Export queue credentials in a format compatible with [AWS SDK credentials_process].
+
+    These credentials assume the service role of a [Deadline Cloud queue] and give access to resources
+    needed for creating and running jobs like the [job attachments] S3 bucket and any other resources
+    authorized by the role.
+
+    [AWS SDK credentials_process]: https://docs.aws.amazon.com/sdkref/latest/guide/feature-process-credentials.html
+    [Deadline Cloud queue]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/queues.html
+    [job attachments]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/storage-job-attachments.html
     """
     start_time = time.time()
     is_success = True
@@ -167,7 +184,13 @@ def queue_export_credentials(mode, output_format, **args):
 @_handle_error
 def queue_paramdefs(**args):
     """
-    Lists a Queue's Parameters Definitions.
+    Lists the parameter definitions for a [Deadline Cloud queue] in the farm.
+
+    The parameter definitions include all the parameters defined by the
+    [queue environments] configured for the queue.
+
+    [Deadline Cloud queue]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/queues.html
+    [queue environments]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/create-queue-environment.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(required_options={"farm_id", "queue_id"}, **args)
@@ -192,9 +215,9 @@ def queue_paramdefs(**args):
 @_handle_error
 def queue_get(**args):
     """
-    Get the details of a queue.
+    Get the details of a [Deadline Cloud queue] in the farm.
 
-    If Queue ID is not provided, returns the configured default Queue.
+    [Deadline Cloud queue]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/queues.html
     """
     # Get a temporary config object with the standard options handled
     config = _apply_cli_options_to_config(required_options={"farm_id", "queue_id"}, **args)
@@ -209,9 +232,14 @@ def queue_get(**args):
     click.echo(_cli_object_repr(response))
 
 
-@cli_queue.command(name="incremental-output-download")
+@cli_queue.command(name="sync-output")
+@click.option("--profile", help="The AWS profile to use.")
 @click.option("--farm-id", help="The AWS Deadline Cloud Farm to use.")
 @click.option("--queue-id", help="The AWS Deadline Cloud Queue to use.")
+@click.option(
+    "--storage-profile-id",
+    help="The storage profile to use for mapping paths to local. Cannot be used together with --ignore-storage-profiles",
+)
 @click.option("--json", default=None, is_flag=True, help="Output is printed as JSON for scripting.")
 @click.option(
     "--bootstrap-lookback-minutes",
@@ -234,6 +262,13 @@ def queue_get(**args):
     default=False,
 )
 @click.option(
+    "--ignore-storage-profiles",
+    is_flag=True,
+    help="Ignores the storage profile configuration. Only use if all jobs in the queue are submitted and downloaded from the same machine. Downloads all jobs to unmapped paths regardless of operating system.\n"
+    "Default value is False.",
+    default=False,
+)
+@click.option(
     "--conflict-resolution",
     type=click.Choice(
         [
@@ -250,28 +285,50 @@ def queue_get(**args):
     "OVERWRITE (default): Download and replace the existing file.\n"
     "Default behaviour is to OVERWRITE.",
 )
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Perform a dry run of the operation, don't actually download the output files.",
+    default=False,
+)
 @_handle_error
-def incremental_output_download(
+@api.record_success_fail_telemetry_event(metric_name="queue_sync_output")
+def sync_output(
     json: bool,
     bootstrap_lookback_minutes: float,
     checkpoint_dir: str,
     force_bootstrap: bool,
+    ignore_storage_profiles: bool,
+    conflict_resolution: str,
+    dry_run: bool,
     **args,
 ):
     """
-    BETA - Downloads job attachments output incrementally for all jobs in a queue. When run for the
-    first time or with the --force-bootstrap option, it starts downloading from --bootstrap-lookback-minutes
+    Downloads any new [job attachments] output for all jobs in a [Deadline Cloud queue] since the last run of the same command.
+    You can use this command to configure [automatic downloads] for your queue.
+
+    When run for the first time or with the --force-bootstrap option, it starts downloading from --bootstrap-lookback-minutes
     in the past. When run each subsequent time, it loads  the previous checkpoint and continues
     where it left off.
 
-    To try this command, set the ENABLE_INCREMENTAL_OUTPUT_DOWNLOAD environment variable to 1 to acknowledge its
-    incomplete beta status.
+    With default options, the sync-output operation requires a storage profile defined in the deadline client configuration
+    or provided with the --storage-profile-id option. Storage profiles are used to generate path mappings when a job was
+    submitted from a machine with a different operating system or file system mount locations than the machine downloading outputs.
 
-    [NOTE] This command is still WIP and partially implemented right now.
+    If you only submit and download jobs from the same operating system and mount locations, you can use the --ignore-storage-profiles option.
+
+    [job attachments]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/storage-job-attachments.html
+    [Deadline Cloud queue]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/queues.html
+    [automatic downloads]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/auto-downloads.html
     """
-    if os.environ.get("ENABLE_INCREMENTAL_OUTPUT_DOWNLOAD") != "1":
-        raise DeadlineOperationError(
-            "The incremental-output-download command is not fully implemented. You must set the environment variable ENABLE_INCREMENTAL_OUTPUT_DOWNLOAD to 1 to acknowledge this."
+    api._session.session_context["cli-command-name"] = "deadline.queue.sync-output"
+
+    if sys.version_info < (3, 9):
+        raise DeadlineOperationError("The sync-output command requires Python version 3.9 or later")
+
+    if ignore_storage_profiles and args.get("storage_profile_id") is not None:
+        raise click.UsageError(
+            "Options '--storage-profile-id' and '--ignore-storage-profiles' cannot be provided together"
         )
 
     logger: ClickLogger = ClickLogger(is_json=json)
@@ -295,36 +352,85 @@ def incremental_output_download(
     farm_id = config_file.get_setting("defaults.farm_id", config=config)
     queue_id = config_file.get_setting("defaults.queue_id", config=config)
     boto3_session: boto3.Session = api.get_boto3_session(config=config)
+    deadline = get_session_client(boto3_session, "deadline")
 
-    # Get download progress file name appended by the queue id - a unique progress file exists per queue
-    download_checkpoint_file_name: str = f"{queue_id}_{DOWNLOAD_CHECKPOINT_FILE_NAME}"
+    if ignore_storage_profiles:
+        local_storage_profile_id = None
+        logger.echo("Ignoring all storage profiles.")
+    else:
+        local_storage_profile_id = config_file.get_setting(
+            "settings.storage_profile_id", config=config
+        )
+        if not local_storage_profile_id:
+            raise DeadlineOperationError(
+                "The sync-output operation requires a storage profile defined in the deadline client configuration or "
+                "provided with the --storage-profile-id option.\n\n"
+                "Storage profiles are used to generate path mappings when a job was submitted from a machine with a different "
+                "operating system or file system mount locations than the machine downloading outputs. See "
+                "https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/modeling-your-shared-filesystem-locations-with-storage-profiles.html "
+                "for more information.\n\n"
+                "If you only submit and download jobs from the same operating system and mount locations, you can use the --ignore-storage-profiles option."
+            )
+
+        try:
+            local_storage_profile = deadline.get_storage_profile_for_queue(
+                farmId=farm_id,
+                queueId=queue_id,
+                storageProfileId=local_storage_profile_id,
+            )
+        except ClientError as e:
+            id_source = (
+                "configured locally"
+                if args.get("storage_profile_id") is None
+                else "provided with --storage-profile-id"
+            )
+            raise DeadlineOperationError(
+                f"Could not retrieve the storage profile {local_storage_profile_id!r}, {id_source}, from Deadline Cloud:\n{e}"
+            )
+
+    # Get download progress file name appended by the queue id and storage profile id - a unique progress file exists per queue/storage profile
+    download_checkpoint_file_name: str = f"{queue_id}_{local_storage_profile_id or 'ignore-storage-profiles'}_{DOWNLOAD_CHECKPOINT_FILE_NAME}"
 
     # Get saved progress file full path now that we've validated all file inputs are valid
     checkpoint_file_path: str = os.path.join(checkpoint_dir, download_checkpoint_file_name)
 
-    deadline = boto3_session.client("deadline")
-    response = deadline.get_queue(farmId=farm_id, queueId=queue_id)
-    logger.echo(f"Started incremental download for queue: {response['displayName']}")
+    queue = deadline.get_queue(farmId=farm_id, queueId=queue_id)
+    if "jobAttachmentSettings" not in queue:
+        raise DeadlineOperationError(
+            f"Queue '{queue['displayName']}' does not have job attachments configured."
+        )
+
+    logger.echo(f"Started incremental download for queue: {queue['displayName']}")
     logger.echo(f"Checkpoint: {checkpoint_file_path}")
     logger.echo()
 
+    if local_storage_profile_id:
+        logger.echo(
+            f"Mapping job output paths to the local storage profile {local_storage_profile['displayName']} ({local_storage_profile_id})"
+        )
+        logger.echo("  File system locations for the storage profile are:")
+        for location in local_storage_profile["fileSystemLocations"]:
+            logger.echo(f"    {location['name']}: {location['path']}")
+        logger.echo()
+
     # Perform incremental download while holding a process id lock
 
-    pid_lock_file_path: str = os.path.join(checkpoint_dir, f"{queue_id}_{PID_FILE_NAME}")
+    pid_lock_file_path: str = os.path.join(checkpoint_dir, f"{download_checkpoint_file_name}.pid")
 
     with PidFileLock(
         pid_lock_file_path,
         operation_name="incremental output download",
     ):
-        current_download_state: IncrementalDownloadState
+        checkpoint: IncrementalDownloadState
 
         if force_bootstrap or not os.path.exists(checkpoint_file_path):
             bootstrap_timestamp = datetime.now(timezone.utc) - timedelta(
                 minutes=bootstrap_lookback_minutes
             )
             # Bootstrap with the specified lookback duration
-            current_download_state = IncrementalDownloadState(
-                downloads_started_timestamp=bootstrap_timestamp
+            checkpoint = IncrementalDownloadState(
+                local_storage_profile_id=local_storage_profile_id,
+                downloads_started_timestamp=bootstrap_timestamp,
             )
 
             # Print the bootstrap time in local time
@@ -337,12 +443,27 @@ def incremental_output_download(
             logger.echo(f"Initializing from: {bootstrap_timestamp.astimezone().isoformat()}")
         else:
             # Load the incremental download checkpoint file
-            current_download_state = IncrementalDownloadState.from_file(checkpoint_file_path)
+            checkpoint = IncrementalDownloadState.from_file(checkpoint_file_path)
 
             # Print the previous download completed time in local time
             logger.echo("Checkpoint found")
+
+            # The checkpoint's local storage profile id must match the CLI option
+            if local_storage_profile_id != checkpoint.local_storage_profile_id:
+                if checkpoint.local_storage_profile_id is None:
+                    raise DeadlineOperationError(
+                        "The checkpoint was created with the --ignore-storage-profiles, you must use the same option to continue from it."
+                    )
+                if local_storage_profile_id is None:
+                    raise DeadlineOperationError(
+                        "The checkpoint was created without the --ignore-storage-profiles, you must leave out the option to continue from it."
+                    )
+                raise DeadlineOperationError(
+                    f"The checkpoint was created with local storage profile {checkpoint.local_storage_profile_id}, but the configured storage profile is {local_storage_profile_id}"
+                )
+
             logger.echo(
-                f"Continuing from: {current_download_state.downloads_completed_timestamp.astimezone().isoformat()}"
+                f"Continuing from: {checkpoint.downloads_completed_timestamp.astimezone().isoformat()}"
             )
 
         logger.echo()
@@ -350,10 +471,17 @@ def incremental_output_download(
         updated_download_state: IncrementalDownloadState = _incremental_output_download(
             boto3_session=boto3_session,
             farm_id=farm_id,
-            queue_id=queue_id,
-            download_state=current_download_state,
+            queue=queue,
+            checkpoint=checkpoint,
+            file_conflict_resolution=FileConflictResolution[conflict_resolution],
+            config=config,
             print_function_callback=logger.echo,
+            dry_run=dry_run,
         )
 
-        # Save the checkpoint file
-        updated_download_state.save_file(checkpoint_file_path)
+        # Save the checkpoint file if it's not a dry run
+        if not dry_run:
+            updated_download_state.save_file(checkpoint_file_path)
+            logger.echo("Checkpoint saved")
+        else:
+            logger.echo("This is a DRY RUN so the checkpoint was not saved")

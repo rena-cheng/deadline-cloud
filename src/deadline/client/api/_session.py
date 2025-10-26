@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 
 import boto3  # type: ignore[import]
 import botocore
+import botocore.config
 from botocore.client import BaseClient  # type: ignore[import]
 from botocore.credentials import CredentialProvider, RefreshableCredentials
 from botocore.exceptions import (  # type: ignore[import]
@@ -43,19 +44,22 @@ class AwsAuthenticationStatus(Enum):
 
 
 # Place for stashing context to be attached to boto clients.
-session_context: dict[str, Optional[str]] = {"submitter-name": None}
+session_context: dict[str, Optional[str]] = {
+    "submitter-name": None,
+    "cli-command-name": None,
+}
 
 
 def get_boto3_session(
     force_refresh: bool = False, config: Optional[ConfigParser] = None
 ) -> boto3.Session:
     """
-    Gets a boto3 session for the configured AWS Deadline Cloud aws profile. This may
-    either use a named profile or the default credentials provider chain.
+    Gets a boto3 session for the AWS Deadline Cloud aws profile from the local
+    configuration `~/.deadline/config`. This may either use a named profile
+    or the default credentials provider chain.
 
-    This implementation caches the session object for use across the CLI code,
-    so that we can use the following code pattern without repeated calls to
-    an external credentials provider process, for example.
+    This implementation caches the session object for use across multiple calls
+    unless `force_refresh` is set to True.
 
     Args:
         force_refresh (bool, optional): If set to True, forces a cache refresh.
@@ -106,16 +110,19 @@ def invalidate_boto3_session_cache() -> None:
     _get_queue_user_boto3_session.cache_clear()
 
 
-def get_default_client_config() -> botocore.config.Config:
+def get_default_client_config(**kwargs) -> botocore.config.Config:
     """
-    Gets the default botocore Config object to use with `boto3 sessions`.
+    Gets the default botocore Config object to use with `boto3 clients`.
     This method adds user agent version and submitter context into botocore calls.
+    Additional arguments are forwarded to the Config constructor.
     """
     user_agent_extra = f"app/deadline-client#{version}"
     if session_context.get("submitter-name"):
         user_agent_extra += f" submitter/{session_context['submitter-name']}"
-    session_config = botocore.config.Config(user_agent_extra=user_agent_extra)
-    return session_config
+    if session_context.get("cli-command-name"):
+        user_agent_extra += f" cli-command/{session_context['cli-command-name']}"
+    client_config = botocore.config.Config(user_agent_extra=user_agent_extra, **kwargs)
+    return client_config
 
 
 @lru_cache
@@ -140,8 +147,6 @@ def get_session_client(session: boto3.Session, service_name: str):
 def get_boto3_client(service_name: str, config: Optional[ConfigParser] = None) -> BaseClient:
     """
     Gets a client from the boto3 session returned by `get_boto3_session`.
-    If the client requested is `deadline`, it uses the AWS_ENDPOINT_URL_DEADLINE
-    deadline endpoint url.
 
     Args:
         service_name (str): The AWS service to get the client for, e.g. "deadline".
@@ -327,6 +332,7 @@ def precache_clients(
         Created (or current) s3 client for the given queue_role_session
 
     Example:
+        ```
         # Fire and forget initialization in a background thread
         import threading
         threading.Thread(
@@ -334,6 +340,7 @@ def precache_clients(
             daemon=True,
             name="S3ClientInit"
         ).start()
+        ```
     """
     if not deadline:
         deadline = get_boto3_client("deadline", config=config)
