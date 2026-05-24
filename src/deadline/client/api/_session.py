@@ -26,7 +26,7 @@ from botocore.exceptions import (  # type: ignore[import]
 from botocore.session import get_session as get_botocore_session
 
 from .. import version
-from ..config import get_setting
+from ..config import get_setting, config_file
 from ..exceptions import DeadlineOperationError
 from ...job_attachments._aws.aws_clients import get_s3_client
 
@@ -46,6 +46,7 @@ class AwsAuthenticationStatus(Enum):
 # Place for stashing context to be attached to boto clients.
 session_context: dict[str, Optional[str]] = {
     "submitter-name": None,
+    "submitter-version": None,
     "cli-command-name": None,
 }
 
@@ -118,7 +119,10 @@ def get_default_client_config(**kwargs) -> botocore.config.Config:
     """
     user_agent_extra = f"app/deadline-client#{version}"
     if session_context.get("submitter-name"):
-        user_agent_extra += f" submitter/{session_context['submitter-name']}"
+        submitter_extra = f" submitter/{session_context['submitter-name']}"
+        if session_context.get("submitter-version"):
+            submitter_extra += f"#{session_context['submitter-version']}"
+        user_agent_extra += submitter_extra
     if session_context.get("cli-command-name"):
         user_agent_extra += f" cli-command/{session_context['cli-command-name']}"
     client_config = botocore.config.Config(user_agent_extra=user_agent_extra, **kwargs)
@@ -136,7 +140,7 @@ def get_session_client(session: boto3.Session, service_name: str):
 
     Args:
         session: The boto3 Session to use for creating the client
-        service_name: The name of the AWS service (e.g., 's3', 'sts', 'ec2')
+        service_name: The name of the AWS service (e.g., 'deadline', 's3')
 
     Returns:
         A boto3 client for the specified service
@@ -157,7 +161,9 @@ def get_boto3_client(service_name: str, config: Optional[ConfigParser] = None) -
     return get_session_client(session=session, service_name=service_name)
 
 
-def get_credentials_source(config: Optional[ConfigParser] = None) -> AwsCredentialsSource:
+def get_credentials_source(
+    config: Optional[ConfigParser] = None,
+) -> AwsCredentialsSource:
     """
     Returns DEADLINE_CLOUD_MONITOR_LOGIN if Deadline Cloud monitor wrote the credentials, HOST_PROVIDED otherwise.
 
@@ -277,10 +283,34 @@ def _modified_logging_level(logger, level):
         logger.setLevel(old_level)
 
 
-def check_authentication_status(config: Optional[ConfigParser] = None) -> AwsAuthenticationStatus:
+def _list_farms_for_auth_probe(config: Optional[ConfigParser] = None) -> None:
     """
-    Checks the status of the provided session, by
-    calling the sts::GetCallerIdentity API.
+    Makes a minimal ``deadline:ListFarms`` call used as an auth/reachability
+    probe by :func:`check_authentication_status` and
+    :func:`check_deadline_api_available`.
+
+    For Deadline Cloud monitor profiles, injects ``principalId`` so the call
+    is scoped to the caller's IdC user (matching the :func:`api.list_farms`
+    wrapper). Without it, IdC-issued sessions get denied by the service and
+    the auth-login poll loop never resolves to AUTHENTICATED.
+
+    Raises whatever exception the underlying boto3 call raises; callers are
+    responsible for exception handling.
+    """
+    from ._list_apis import _apply_principal_id_filter
+
+    list_farm_params: dict = {"maxResults": 1}
+    _apply_principal_id_filter(list_farm_params, config=config)
+    get_boto3_client("deadline", config=config).list_farms(**list_farm_params)
+
+
+def check_authentication_status(
+    config: Optional[ConfigParser] = None,
+) -> AwsAuthenticationStatus:
+    """
+    Checks the status of the provided session by making a small ``deadline:ListFarms``
+    API call. This validates both that credentials are usable and that the session can
+    reach the Deadline Cloud API.
 
     Args:
         config (ConfigParser, optional): The AWS Deadline Cloud configuration
@@ -294,7 +324,7 @@ def check_authentication_status(config: Optional[ConfigParser] = None) -> AwsAut
 
     with _modified_logging_level(logging.getLogger("botocore.credentials"), logging.ERROR):
         try:
-            get_boto3_session(config=config).client("sts").get_caller_identity()
+            _list_farms_for_auth_probe(config=config)
             return AwsAuthenticationStatus.AUTHENTICATED
         except Exception:
             # We assume that the presence of a Deadline Cloud monitor profile
@@ -364,7 +394,10 @@ def precache_clients(
         queue_display_name=queue_display_name,
     )
     # Initialize the S3 client to populate the cache
-    return deadline, get_s3_client(queue_role_session)
+    s3_max_pool_connections = int(config_file.get_setting("settings.s3_max_pool_connections"))
+    return deadline, get_s3_client(
+        queue_role_session, s3_max_pool_connections=s3_max_pool_connections
+    )
 
 
 class QueueUserCredentialProvider(CredentialProvider):

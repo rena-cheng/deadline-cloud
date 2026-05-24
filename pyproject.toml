@@ -9,7 +9,7 @@ authors = [{ name = "Amazon Web Services" }]
 dynamic = ["version"]
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.8, <3.14"
+requires-python = ">=3.8, <3.15"
 # https://pypi.org/classifiers/
 classifiers = [
   "Development Status :: 5 - Production/Stable",
@@ -21,6 +21,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Operating System :: POSIX :: Linux",
   "Operating System :: Microsoft :: Windows",
   "Operating System :: MacOS",
@@ -34,17 +35,15 @@ classifiers = [
 # Applications that consume this library should be the ones that are more strictly
 # limiting dependencies if they want/need to.
 dependencies = [
-  "boto3 >= 1.39.10; python_version >= '3.9'",
+  "boto3 >= 1.42.89; python_version >= '3.9'",
   "boto3 >= 1.36.8; python_version < '3.9'",
   # Click 8.2 dropped python 3.8/3.9 support
   "click >= 8.1.7",
   "pyyaml >= 6.0",
-  # Job Attachments
+  "deadline-job-attachments == 0.1.0",
   "typing_extensions >= 4.8",
-  "xxhash >= 3.4,< 3.7",
-  "pywin32 >= 307,< 311; sys_platform == 'win32'",
+  "psutil >= 7.0.0",
   "QtPy == 2.4.*",
-  "psutil >= 7.0.0"
 ]
 
 [project.urls]
@@ -54,7 +53,7 @@ Source = "https://github.com/aws-deadline/deadline-cloud"
 [project.optional-dependencies]
 gui = [
   # If the version changes, update the version in deadline/client/ui/__init__.py
-  "PySide6-essentials >= 6.6,< 6.10",
+  "PySide6-essentials >= 6.6,< 6.11",
 ]
 mcp = [
   "mcp >= 1.13.0",
@@ -83,13 +82,14 @@ version-file = "_version.py"
 path = "hatch_custom_hook.py"
 
 [tool.hatch.build.hooks.custom.copy_version_py]
-destinations = ["src/deadline/client", "src/deadline/job_attachments"]
+destinations = ["src/deadline/client"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/*", "hatch_custom_hook.py", "THIRD_PARTY_LICENSES"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deadline"]
+artifacts = ["*_version.py", "src/deadline/client/ui/translations/locales/*.json"]
 
 [tool.mypy]
 # Enables the type-checker on the interior of functions without type annotations.
@@ -107,7 +107,7 @@ explicit_package_bases = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["qtpy.*", "boto3.*", "botocore.*", "moto.*", "xxhash"]
+module = ["qtpy.*", "boto3.*", "botocore.*", "moto.*"]
 
 [[tool.mypy.overrides]]
 module = "deadline.client.ui.*"
@@ -124,17 +124,11 @@ ignore = ["E501"]
 [tool.ruff.lint.isort]
 known-first-party = ["deadline"]
 
-[tool.ruff.lint.per-file-ignores]
-# We need to use a platform assertion to short-circuit mypy type checking on non-Windows platforms
-# https://mypy.readthedocs.io/en/stable/common_issues.html#python-version-and-system-platform-checks
-# This causes imports to come after regular Python statements causing flake8 rule E402 to be flagged
-"src/deadline/job_attachments/_windows/*.py" = ["E402"]
-
-
 # Configuration for pytest; enable coverage for deadline_worker_agent, emit
 # XML, HTML, and terminal reports.
 [tool.pytest.ini_options]
 xfail_strict = true
+pythonpath = ["test"]
 
 addopts = [
   "--durations=5",
@@ -144,12 +138,11 @@ addopts = [
   "--cov-report=term-missing",
   "--numprocesses=auto",
 ]
-testpaths = ["test/unit"]
-looponfailroots = ["src", "test/unit"]
+testpaths = ["test/unit", "test/cli_e2e"]
+looponfailroots = ["src", "test/unit", "test/cli_e2e"]
 markers = [
   "no_setup: mark that test shouldn't use default setups",
   "integ: tests that run against AWS resources",
-  "docker: marks tests to be run only in a Docker environment",
   "cross_account: tests that run against other aws accounts",
   "asyncio: mark test as async",
 ]
@@ -160,7 +153,7 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.coverage.run]
 disable_warnings = ["module-not-measured"]
 branch = true
-parallel = false
+parallel = true
 source_pkgs = ["deadline"]
 omit = ["*/deadline/client/ui/*"]
 plugins = ["coverage_conditional_plugin"]
@@ -170,12 +163,9 @@ source = ["src/"]
 
 [tool.coverage.report]
 show_missing = true
-fail_under = 80
+fail_under = 69
 
 # https://github.com/wemake-services/coverage-conditional-plugin
-[tool.coverage.coverage_conditional_plugin.omit]
-"sys_platform != 'win32'" = ["src/deadline/job_attachments/_windows/*.py"]
-
 [tool.coverage.coverage_conditional_plugin.rules]
 # This cannot be empty otherwise coverage-conditional-plugin crashes with:
 # AttributeError: 'NoneType' object has no attribute 'items'

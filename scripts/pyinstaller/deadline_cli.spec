@@ -10,11 +10,16 @@ import deadline.client
 b_module_path = os.path.dirname(os.path.dirname(deadline.client.__file__))
 
 ROOT = Path(b_module_path).absolute().parents[1]
-EXE_NAME = 'deadline_cli'
-OUTPUT_DIR = 'deadline_cli'
+EXE_NAME = 'deadline'
+OUTPUT_DIR = 'deadline'
 BLOCK_CIPHER = None
 
 datas, binaries, hiddenimports = collect_all('deadline')
+
+# Filter out optional MCP subpackages
+_MCP_PREFIXES = ('deadline.mcp', 'deadline._mcp', 'mcp')
+hiddenimports = [h for h in hiddenimports if not any(h == p or h.startswith(p + '.') for p in _MCP_PREFIXES)]
+datas = [d for d in datas if not any(p in str(d[0]) for p in ('deadline/mcp', 'deadline/_mcp', 'deadline\\mcp', 'deadline\\_mcp'))]
 
 # The 'datas' parameter adds data files to the bundle.
 # Each entry is a pair (local_filename, destination_path).
@@ -27,6 +32,9 @@ datas += [
 # Can be removed once pyinstaller is upgraded to >= 6.7.0
 hiddenimports += ['pkg_resources.extern']
 
+# PySide6/Qt modules to include
+hiddenimports += ['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets']
+
 cli_a = Analysis(
     ['../../src/deadline/client/cli/deadline_cli_main.py'],
     binaries=binaries,
@@ -38,12 +46,21 @@ cli_a = Analysis(
         'cmd',
         'code',
         'pdb',
+        'readline',
         'setuptools',
         'jaraco',
         'importlib_metadata',
         'zipp',
         'pkg_resources',
         'pyinstaller_hooks_contrib',
+        # MCP is optional - exclude the MCP package itself.
+        # Its transitive deps (httpx, uvicorn, etc.) are not listed here
+        # because some may also be real dependencies of the core package
+        # (e.g. certifi, idna, jsonschema). PyInstaller's dependency
+        # analysis will only include what's actually imported.
+        'deadline.mcp',
+        'deadline._mcp',
+        'mcp',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -66,10 +83,8 @@ if sys.platform == "win32":
     
     cli_a.binaries += [('python3.dll', python3_dll, 'BINARY')]
 
-# Filter out the UI submodule for now
-deadline_ui = os.path.join('deadline', 'ui')
-cli_a.datas = [item for item in cli_a.datas if not item[0].startswith(deadline_ui)]
 
+cli_a.datas = [item for item in cli_a.datas if not item[0].startswith("Python.framework")]
 cli_a.exclude_system_libraries(list_of_exceptions=['libssl*', 'libsqlite3*', 'libcrypto*'])
 
 cli_pyz = PYZ(cli_a.pure, cli_a.zipped_data, cipher=BLOCK_CIPHER)

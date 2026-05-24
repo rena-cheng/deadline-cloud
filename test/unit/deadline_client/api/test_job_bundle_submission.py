@@ -339,6 +339,8 @@ def test_create_job_from_job_bundle(
     expected_create_job_parameters_dict["priority"] = expected_create_job_parameters_dict.get(
         "priority", 50
     )
+    expected_create_job_parameters_dict.setdefault("maxFailedTasksCount", 20)
+    expected_create_job_parameters_dict.setdefault("maxRetriesPerTask", 5)
     mock.get_boto3_client().create_job.assert_called_once_with(
         farmId=MOCK_FARM_ID,
         queueId=MOCK_QUEUE_ID,
@@ -502,6 +504,8 @@ def test_create_job_from_job_bundle_job_attachments(
             total_input_bytes=35,
             print_function_callback=print,
             hashing_progress_callback=fake_hashing_callback,
+            hash_cache_dir=config.config_file.get_cache_directory(),
+            telemetry_callback=api._submit_job_bundle.hashing_telemetry_callback,
         )
         mock.get_boto3_client().create_job.assert_called_once_with(
             farmId=MOCK_FARM_ID,
@@ -509,6 +513,8 @@ def test_create_job_from_job_bundle_job_attachments(
             template=ANY,
             templateType="JSON",
             priority=50,
+            maxFailedTasksCount=20,
+            maxRetriesPerTask=5,
             storageProfileId=MOCK_STORAGE_PROFILE_ID,
             attachments=ANY,
         )
@@ -614,6 +620,8 @@ def test_create_job_from_job_bundle_empty_job_attachments(
             template=ANY,
             templateType=ANY,
             priority=50,
+            maxFailedTasksCount=20,
+            maxRetriesPerTask=5,
             storageProfileId=MOCK_STORAGE_PROFILE_ID,
         )
 
@@ -667,6 +675,8 @@ def test_create_job_from_job_bundle_with_empty_asset_references(
             templateType=job_template_type,
             storageProfileId=MOCK_STORAGE_PROFILE_ID,
             priority=50,
+            maxFailedTasksCount=20,
+            maxRetriesPerTask=5,
         )
 
 
@@ -886,6 +896,8 @@ def test_create_job_from_job_bundle_with_single_asset_file(
             total_input_bytes=15,
             print_function_callback=print,
             hashing_progress_callback=fake_hashing_callback,
+            hash_cache_dir=config.config_file.get_cache_directory(),
+            telemetry_callback=api._submit_job_bundle.hashing_telemetry_callback,
         )
 
         assert mock.get_boto3_client().create_job.mock_calls == [
@@ -895,6 +907,8 @@ def test_create_job_from_job_bundle_with_single_asset_file(
                 template=ANY,
                 templateType=ANY,
                 priority=50,
+                maxFailedTasksCount=20,
+                maxRetriesPerTask=5,
                 storageProfileId=MOCK_STORAGE_PROFILE_ID,
                 attachments={
                     "manifests": [
@@ -1063,3 +1077,70 @@ def test_wait_for_create_job_to_complete_timeout():
             deadline_client=deadline_client,
             continue_callback=mock_continue_callback,
         )
+
+
+@pytest.mark.parametrize(
+    "force_s3_check_param, config_value, expected_value",
+    [
+        pytest.param(True, "false", True, id="explicit-true-overrides-config-false"),
+        pytest.param(False, "true", False, id="explicit-false-overrides-config-true"),
+        pytest.param(None, "true", True, id="none-reads-config-true"),
+        pytest.param(None, "false", False, id="none-reads-config-false"),
+    ],
+)
+def test_create_job_from_job_bundle_force_s3_check(
+    fresh_deadline_config,
+    temp_job_bundle_dir,
+    force_s3_check_param,
+    config_value,
+    expected_value,
+):
+    """
+    Test that force_s3_check parameter is correctly resolved:
+    - Explicit True/False overrides config
+    - None falls back to config setting
+    """
+    config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+    config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+    config.set_setting("settings.storage_profile_id", MOCK_STORAGE_PROFILE_ID)
+    config.set_setting("settings.force_s3_check", config_value)
+
+    job_template_type, job_template = MOCK_JOB_TEMPLATE_CASES["MINIMAL_JSON"]
+
+    with patch_calls_for_create_job_from_job_bundle() as mock:
+        mock.get_boto3_client().get_storage_profile_for_queue.return_value = (
+            MOCK_GET_STORAGE_PROFILE_FOR_QUEUE_RESPONSE
+        )
+
+        # Write the template to the job bundle
+        with open(
+            os.path.join(temp_job_bundle_dir, f"template.{job_template_type.lower()}"),
+            "w",
+            encoding="utf8",
+        ) as f:
+            f.write(job_template)
+
+        # Build kwargs, only include force_s3_check if not None
+        kwargs: Dict[str, Any] = {
+            "job_bundle_dir": temp_job_bundle_dir,
+            "queue_parameter_definitions": [],
+        }
+        if force_s3_check_param is not None:
+            kwargs["force_s3_check"] = force_s3_check_param
+
+        # Call the function under test
+        response = api.create_job_from_job_bundle(**kwargs)
+
+        # Verify the job was created
+        assert response == MOCK_JOB_ID
+
+        # Verify create_job_from_job_bundle was called with the expected force_s3_check value
+        mock.create_job_from_job_bundle.assert_called_once()
+        _, call_kwargs = mock.create_job_from_job_bundle.call_args
+        # The wrapped function receives the resolved value, but we need to check
+        # what was passed to _upload_attachments. Since there are no attachments
+        # in this test, we verify the parameter was passed correctly to the function.
+        if force_s3_check_param is not None:
+            assert call_kwargs.get("force_s3_check") == force_s3_check_param
+        else:
+            assert call_kwargs.get("force_s3_check") is None

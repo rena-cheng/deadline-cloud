@@ -7,10 +7,9 @@ A UI Widget containing the render setup tab
 from __future__ import annotations
 
 import sys
-import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from qtpy.QtCore import Signal  # type: ignore
+from qtpy.QtCore import Qt, Signal  # type: ignore
 from qtpy.QtWidgets import (  # type: ignore
     QComboBox,
     QFormLayout,
@@ -26,9 +25,9 @@ from qtpy.QtWidgets import (  # type: ignore
 
 from ... import api
 from ...config import get_setting
-from .._utils import CancelationFlag
+from .._utils import tr
+from ..controllers import AsyncTaskRunner, DeadlineUIController
 from .openjd_parameters_widget import OpenJDParametersWidget
-from ...api import get_queue_parameter_definitions
 
 
 class SharedJobSettingsWidget(QWidget):  # pylint: disable=too-few-public-methods
@@ -53,14 +52,6 @@ class SharedJobSettingsWidget(QWidget):  # pylint: disable=too-few-public-method
 
     # Emitted when the queue parameter validity state changes
     valid_parameters = Signal(bool)
-
-    # Emitted when the background refresh thread catches an exception,
-    # provides (operation_name, BaseException)
-    _background_exception = Signal(str, BaseException)
-
-    # Emitted when an async queue parameters loading thread completes,
-    # provides (refresh_id, queue_parameters)
-    _queue_parameters_update = Signal(int, list)
 
     def __init__(
         self,
@@ -92,28 +83,31 @@ class SharedJobSettingsWidget(QWidget):  # pylint: disable=too-few-public-method
             lambda message: self.parameter_changed.emit(message)
         )
 
-        self.__refresh_queue_parameters_thread: Optional[threading.Thread] = None
-        self.__refresh_queue_parameters_id = 0
+        # Track current farm/queue IDs for change detection
+        self.farm_id = get_setting("defaults.farm_id")
+        self.queue_id = get_setting("defaults.queue_id")
         self.__valid_queue = False
-        self.canceled = CancelationFlag()
-        self.destroyed.connect(self.canceled.set_canceled)
-        self._queue_parameters_update.connect(self._handle_queue_parameters_update)
-        self._background_exception.connect(self._handle_background_queue_parameters_exception)
-        self._start_load_queue_parameters_thread()
+
+        # Connect to the controller for queue parameters
+        self._controller = DeadlineUIController.getInstance()
+        self._controller.queue_parameters_updated.connect(
+            self._handle_queue_parameters_update, Qt.QueuedConnection
+        )
+        self._controller.queue_parameters_loading.connect(
+            self._handle_queue_parameters_loading, Qt.QueuedConnection
+        )
+        self._controller.operation_failed.connect(
+            self._handle_operation_failed, Qt.QueuedConnection
+        )
+
+        # Start initial load
+        self._start_load_queue_parameters()
 
         # Set any "deadline:*" parameters, like deadline:priority.
         # The queue parameters will be set asynchronously by the background thread.
         for name, value in initial_shared_parameter_values.items():
             if name.startswith("deadline:"):
                 self.set_parameter_value({"name": name, "value": value})
-
-    def __del__(self):
-        self.canceled.set_canceled()
-        if (
-            self.__refresh_queue_parameters_thread
-            and self.__refresh_queue_parameters_thread.is_alive()
-        ):
-            self.__refresh_queue_parameters_thread.join()
 
     def refresh_ui(self, job_settings: Any, load_new_bundle: bool = False):
         # Refresh the job settings in the UI
@@ -146,77 +140,49 @@ class SharedJobSettingsWidget(QWidget):  # pylint: disable=too-few-public-method
             self.queue_parameters_box.rebuild_ui(
                 async_loading_state="Reloading Queue Environments..."
             )
-            # Join the thread if the queue id or job bundle has changed and the thread is running
-            if (
-                (queue_id != self.queue_id or load_new_bundle)
-                and self.__refresh_queue_parameters_thread
-                and self.__refresh_queue_parameters_thread.is_alive()
-            ):
-                self.__refresh_queue_parameters_thread.join()
+            self._start_load_queue_parameters()
 
-            # Start the thread if it doesn't exist or is not alive
-            if (
-                not self.__refresh_queue_parameters_thread
-                or not self.__refresh_queue_parameters_thread.is_alive()
-            ):
-                self._start_load_queue_parameters_thread()
-
-    def _handle_background_queue_parameters_exception(self, title: str, error: BaseException):
-        self.__valid_queue = False
-        self.valid_parameters.emit(False)
-        if self.__refresh_queue_parameters_thread:
-            self.canceled.set_canceled()
-            self.__refresh_queue_parameters_thread.join()
-        self.queue_parameters_box.rebuild_ui(
-            async_loading_state="Error loading queue environments: {}\n\nError traceback: {}".format(
-                title, error
+    def _handle_queue_parameters_loading(self, is_loading: bool) -> None:
+        """Handle loading state changes from the controller."""
+        if is_loading:
+            self.queue_parameters_box.rebuild_ui(
+                async_loading_state="Loading Queue Environments..."
             )
-        )
 
-    def _start_load_queue_parameters_thread(self):
+    def _handle_operation_failed(self, operation_name: str, error: BaseException) -> None:
+        """Handle operation failures from the controller."""
+        if operation_name == "get_queue_parameters":
+            self.__valid_queue = False
+            self.valid_parameters.emit(False)
+            self.queue_parameters_box.rebuild_ui(
+                async_loading_state="Error loading queue environments: {}\n\nError traceback: {}".format(
+                    "Invalid queue parameters", error
+                )
+            )
+
+    def _start_load_queue_parameters(self):
         """
-        Starts a background thread to load the queue parameters.
+        Triggers the controller to load queue parameters.
         """
         self.farm_id = farm_id = get_setting("defaults.farm_id")
         self.queue_id = queue_id = get_setting("defaults.queue_id")
         if not self.farm_id or not self.queue_id:
-            # If the user has not selected a farm or queue ID, don't bother starting
-            # the thread.
+            # If the user has not selected a farm or queue ID, don't bother loading
             return
-        self.__refresh_queue_parameters_id += 1
-        self.canceled = CancelationFlag()
-        self.__refresh_queue_parameters_thread = threading.Thread(
-            target=self._load_queue_parameters_thread_function,
-            name="AWS Deadline Cloud load queue parameters thread",
-            args=(self.__refresh_queue_parameters_id, farm_id, queue_id),
-        )
-        self.__refresh_queue_parameters_thread.start()
+        self._controller.refresh_queue_parameters(farm_id=farm_id, queue_id=queue_id)
 
     def is_queue_valid(self) -> bool:
         return self.__valid_queue
 
-    def _handle_queue_parameters_update(self, refresh_id, queue_parameters):
-        # Apply the refresh if it's still for the latest call
-        if refresh_id == self.__refresh_queue_parameters_id:
-            self.__valid_queue = True
-            self.valid_parameters.emit(True)
-            # Apply the initial queue parameter values
-            for parameter in queue_parameters:
-                if parameter["name"] in self.initial_shared_parameter_values:
-                    parameter["value"] = self.initial_shared_parameter_values[parameter["name"]]
-            self.queue_parameters_box.rebuild_ui(parameter_definitions=queue_parameters)
-
-    def _load_queue_parameters_thread_function(self, refresh_id: int, farm_id: str, queue_id: str):
-        """
-        This function gets started in a background thread to refresh the list.
-        """
-        try:
-            queue_parameters = get_queue_parameter_definitions(farmId=farm_id, queueId=queue_id)
-            if not self.canceled:
-                self._queue_parameters_update.emit(refresh_id, queue_parameters)
-        except BaseException as e:
-            if not self.canceled:
-                self._background_exception.emit("Invalid queue parameters", e)
+    def _handle_queue_parameters_update(self, queue_parameters: List) -> None:
+        """Handle queue parameters update from the controller."""
+        self.__valid_queue = True
+        self.valid_parameters.emit(True)
+        # Apply the initial queue parameter values
+        for parameter in queue_parameters:
+            if parameter["name"] in self.initial_shared_parameter_values:
+                parameter["value"] = self.initial_shared_parameter_values[parameter["name"]]
+        self.queue_parameters_box.rebuild_ui(parameter_definitions=queue_parameters)
 
     def update_settings(self, settings):
         self.shared_job_properties_box.update_settings(settings)
@@ -254,7 +220,7 @@ class SharedJobPropertiesWidget(QGroupBox):  # pylint: disable=too-few-public-me
     """
 
     def __init__(self, *, initial_settings, parent: Optional[QWidget] = None):
-        super().__init__("Job Properties", parent=parent)
+        super().__init__(tr("Job Properties"), parent=parent)
 
         self._build_ui()
         self.refresh_ui(initial_settings)
@@ -267,22 +233,22 @@ class SharedJobPropertiesWidget(QGroupBox):  # pylint: disable=too-few-public-me
         self.sub_name_edit.setMaxLength(128)
         self.layout.addRow("Name", self.sub_name_edit)
 
-        self.desc_label = QLabel("Description")
+        self.desc_label = QLabel(tr("Description"))
         self.desc_edit = QLineEdit()
         self.desc_edit.setMaxLength(2048)
         self.layout.addRow(self.desc_label, self.desc_edit)
 
-        self.priority_box_label = QLabel("Priority")
+        self.priority_box_label = QLabel(tr("Priority"))
         self.priority_box = QSpinBox(parent=self)
         self.priority_box.setRange(0, 100)
         self.layout.addRow(self.priority_box_label, self.priority_box)
 
-        self.initial_status_box_label = QLabel("Initial state")
+        self.initial_status_box_label = QLabel(tr("Initial state"))
         self.initial_status_box = QComboBox(parent=self)
         self.initial_status_box.addItems(["READY", "SUSPENDED"])
         self.layout.addRow(self.initial_status_box_label, self.initial_status_box)
 
-        self.max_failed_tasks_count_box_label = QLabel("Maximum failed tasks count")
+        self.max_failed_tasks_count_box_label = QLabel(tr("Maximum failed tasks count"))
         self.max_failed_tasks_count_box_label.setToolTip(
             "Maximum number of tasks that can fail before the job will be marked as failed."
         )
@@ -290,7 +256,7 @@ class SharedJobPropertiesWidget(QGroupBox):  # pylint: disable=too-few-public-me
         self.max_failed_tasks_count_box.setRange(0, 2147483647)
         self.layout.addRow(self.max_failed_tasks_count_box_label, self.max_failed_tasks_count_box)
 
-        self.max_retries_per_task_box_label = QLabel("Maximum retries per task")
+        self.max_retries_per_task_box_label = QLabel(tr("Maximum retries per task"))
         self.max_retries_per_task_box_label.setToolTip(
             "Maximum number of times that a task will retry before it's marked as failed."
         )
@@ -298,12 +264,12 @@ class SharedJobPropertiesWidget(QGroupBox):  # pylint: disable=too-few-public-me
         self.max_retries_per_task_box.setRange(0, 2147483647)
         self.layout.addRow(self.max_retries_per_task_box_label, self.max_retries_per_task_box)
 
-        self.max_worker_count_box_label = QLabel("Maximum worker count")
-        self.max_worker_count_box_label.setToolTip("Maximum worker count of job.")
+        self.max_worker_count_box_label = QLabel(tr("Maximum worker count"))
+        self.max_worker_count_box_label.setToolTip(tr("Maximum worker count of job."))
         self.max_worker_count_box = QSpinBox()
         self.max_worker_count_box.setRange(1, 2147483647)
-        self.unlimited_max_worker_count = QRadioButton("No max worker count")
-        self.limited_max_worker_count = QRadioButton("Set max worker count")
+        self.unlimited_max_worker_count = QRadioButton(tr("No max worker count"))
+        self.limited_max_worker_count = QRadioButton(tr("Set max worker count"))
         self.limited_max_worker_count.toggled.connect(
             self.limited_max_worker_count_radio_button_toggled
         )
@@ -340,12 +306,12 @@ class SharedJobPropertiesWidget(QGroupBox):  # pylint: disable=too-few-public-me
         self.max_failed_tasks_count_box.setValue(
             settings.max_failed_tasks_count
             if self._has_compatible_attr(settings, "max_failed_tasks_count", int)
-            else 20
+            else int(get_setting("settings.max_failed_tasks_count"))
         )
         self.max_retries_per_task_box.setValue(
             settings.max_retries_per_task
             if self._has_compatible_attr(settings, "max_retries_per_task", int)
-            else 5
+            else int(get_setting("settings.max_retries_per_task"))
         )
         self.priority_box.setValue(
             settings.priority if self._has_compatible_attr(settings, "priority", int) else 50
@@ -429,7 +395,11 @@ class SharedJobPropertiesWidget(QGroupBox):  # pylint: disable=too-few-public-me
                 "minValue": 0,
                 "value": self.max_retries_per_task_box.value(),
             },
-            {"name": "deadline:priority", "type": "INT", "value": self.priority_box.value()},
+            {
+                "name": "deadline:priority",
+                "type": "INT",
+                "value": self.priority_box.value(),
+            },
         ]
         if not self.unlimited_max_worker_count.isChecked():
             job_parameters.append(
@@ -477,7 +447,7 @@ class DeadlineCloudSettingsWidget(QGroupBox):
     """
 
     def __init__(self, *, parent: Optional[QWidget] = None):
-        super().__init__("Deadline Cloud settings", parent=parent)
+        super().__init__(tr("Deadline Cloud settings"), parent=parent)
         self.deadline_settings: Dict[str, Any] = {"counter": -1}
         self.layout = QFormLayout(self)
         self.layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -493,11 +463,11 @@ class DeadlineCloudSettingsWidget(QGroupBox):
         """
         Build the UI for the Deadline settings
         """
-        self.farm_box_label = QLabel("Farm")
+        self.farm_box_label = QLabel(tr("Farm"))
         self.farm_box = DeadlineFarmDisplay()
         self.layout.addRow(self.farm_box_label, self.farm_box)
 
-        self.queue_box_label = QLabel("Queue")
+        self.queue_box_label = QLabel(tr("Queue"))
         self.queue_box = DeadlineQueueDisplay()
         self.layout.addRow(self.queue_box_label, self.queue_box)
 
@@ -521,6 +491,8 @@ class _DeadlineNamedResourceDisplay(QWidget):
     it as the Id, but does an async call to AWS Deadline Cloud to convert it
     to the name.
 
+    Uses AsyncTaskRunner for background API calls with automatic cancellation.
+
     Args:
         resource_name (str): The resource name for the list, like "Farm",
                 "Queue", "Fleet".
@@ -531,23 +503,18 @@ class _DeadlineNamedResourceDisplay(QWidget):
     # provides (operation_name, BaseException)
     background_exception = Signal(str, BaseException)
 
-    # Emitted when an async refresh_item thread completes,
-    # provides (refresh_id, id, name, description)
-    _item_update = Signal(int, str, str, str)
-
     def __init__(self, *, resource_name, setting_name, parent: Optional[QWidget] = None):
         super().__init__(parent=parent)
-
-        self.__refresh_thread = None
-        self.__refresh_id = 0
-        self.canceled = CancelationFlag()
-        self.destroyed.connect(self.canceled.set_canceled)
 
         self.resource_name = resource_name
         self.setting_name = setting_name
         self.item_id = get_setting(self.setting_name)
         self.item_name = ""
         self.item_description = ""
+
+        # Use AsyncTaskRunner for background API calls
+        self._runner = AsyncTaskRunner(self)
+        self._runner.task_error.connect(self._handle_error, Qt.QueuedConnection)
 
         self._build_ui()
 
@@ -558,8 +525,11 @@ class _DeadlineNamedResourceDisplay(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.label)
-        self._item_update.connect(self.handle_item_update)
         self.background_exception.connect(self.handle_background_exception)
+
+    def _handle_error(self, operation_name: str, error: BaseException) -> None:
+        """Handle errors from the async runner."""
+        self.background_exception.emit(f"Refresh {self.resource_name} item", error)
 
     def handle_background_exception(self, e):
         self.label.setText(self.item_id)
@@ -571,7 +541,7 @@ class _DeadlineNamedResourceDisplay(QWidget):
 
     def refresh(self, deadline_authorized):
         """
-        Starts a background thread to refresh the item name.
+        Starts a background task to refresh the item name.
 
         Args:
             deadline_authorized (bool): Should be the result of a call to
@@ -588,39 +558,26 @@ class _DeadlineNamedResourceDisplay(QWidget):
             if deadline_authorized:
                 display_name = "<refreshing> - " + display_name
 
-                self.__refresh_id += 1
-                self.__refresh_thread = threading.Thread(
-                    target=self._refresh_thread_function,
-                    name=f"AWS Deadline Cloud refresh {self.resource_name} item thread",
-                    args=(self.__refresh_id,),
+                self._runner.run(
+                    operation_key=f"get_{self.resource_name}",
+                    fn=self.get_item,
+                    on_success=self._handle_item_update,
+                    on_error=lambda e: self._handle_error(f"get_{self.resource_name}", e),
                 )
-                self.__refresh_thread.start()
 
             self.label.setText(display_name)
             self.label.setToolTip(self.item_description)
         else:
             self.label.setText(self.item_display_name())
 
-    def handle_item_update(self, refresh_id, id, name, description):
-        # Apply the refresh if it's still for the latest call
-        if refresh_id == self.__refresh_id:
-            self.item_id = id
-            self.item_name = name
-            self.item_description = description
-            self.label.setText(self.item_display_name())
-            self.label.setToolTip(self.item_description)
-
-    def _refresh_thread_function(self, refresh_id: int):
-        """
-        This function gets started in a background thread to refresh the list.
-        """
-        try:
-            item = self.get_item()
-            if not self.canceled:
-                self._item_update.emit(refresh_id, *item)
-        except BaseException as e:
-            if not self.canceled:
-                self.background_exception.emit(f"Refresh {self.resource_name} item", e)
+    def _handle_item_update(self, item: tuple) -> None:
+        """Handle successful item fetch."""
+        item_id, name, description = item
+        self.item_id = item_id
+        self.item_name = name
+        self.item_description = description
+        self.label.setText(self.item_display_name())
+        self.label.setToolTip(self.item_description)
 
 
 class DeadlineFarmDisplay(_DeadlineNamedResourceDisplay):
@@ -632,7 +589,11 @@ class DeadlineFarmDisplay(_DeadlineNamedResourceDisplay):
         if farm_id:
             deadline = api.get_boto3_client("deadline")
             response = deadline.get_farm(farmId=farm_id)
-            return (response["farmId"], response["displayName"], response["description"])
+            return (
+                response["farmId"],
+                response["displayName"],
+                response["description"],
+            )
         else:
             return ("", "", "")
 
@@ -647,7 +608,11 @@ class DeadlineQueueDisplay(_DeadlineNamedResourceDisplay):
         if farm_id and queue_id:
             deadline = api.get_boto3_client("deadline")
             response = deadline.get_queue(farmId=farm_id, queueId=queue_id)
-            return (response["queueId"], response["displayName"], response["description"])
+            return (
+                response["queueId"],
+                response["displayName"],
+                response["description"],
+            )
         else:
             return ("", "", "")
 

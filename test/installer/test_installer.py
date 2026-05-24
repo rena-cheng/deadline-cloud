@@ -98,10 +98,12 @@ def _validate_files(installation_path: Path) -> None:
     assert cli_result.returncode == 0
 
     # Just check that we have dependencies in this folder
-    cli_dir = installation_path / "DeadlineClient" / "_internal" / "cli" / "_internal"
+    cli_dir = installation_path / "DeadlineClient" / "_internal"
     cli_dir_contents = [f.name for f in (cli_dir).iterdir()]
     assert "deadline" in cli_dir_contents
     assert "xxhash" in cli_dir_contents
+    assert "PySide6" in cli_dir_contents
+    assert "shiboken6" in cli_dir_contents
 
     # Check the deadline module is here and there's a version file
     client_dir = [f.name for f in (cli_dir.joinpath("deadline", "client")).iterdir()]

@@ -72,25 +72,46 @@ def test_get_boto3_session_caching_behavior(fresh_deadline_config):
 
 
 def test_get_check_authentication_status_authenticated(fresh_deadline_config):
-    """Confirm that check_authentication_status returns AUTHENTICATED"""
-    with patch.object(api._session, "get_boto3_session") as session_mock, patch.object(
-        api, "get_boto3_session", new=session_mock
+    """Confirm that check_authentication_status returns AUTHENTICATED (non-DCM profile)."""
+    with patch.object(api._session, "get_boto3_client") as boto3_client_mock, patch.object(
+        api._list_apis, "get_user_and_identity_store_id", return_value=(None, None)
     ):
         config.set_setting("defaults.aws_profile_name", "SomeRandomProfileName")
-        session_mock().client("sts").get_caller_identity.return_value = {}
+        boto3_client_mock.return_value.list_farms.return_value = {"farms": []}
 
         assert api.check_authentication_status() == api.AwsAuthenticationStatus.AUTHENTICATED
+        # Without a DCM-provided user_id, principalId must not be injected.
+        boto3_client_mock.return_value.list_farms.assert_called_once_with(maxResults=1)
+
+
+def test_get_check_authentication_status_authenticated_injects_principal_id(
+    fresh_deadline_config,
+):
+    """For Deadline Cloud monitor profiles, check_authentication_status must pass
+    the IdC user id as principalId so the ListFarms probe is scoped to the
+    caller's user membership (avoids AccessDenied that would otherwise leave
+    the auth-login poll loop stuck in NEEDS_LOGIN)."""
+    with patch.object(api._session, "get_boto3_client") as boto3_client_mock, patch.object(
+        api._list_apis,
+        "get_user_and_identity_store_id",
+        return_value=("user-1234", "d-abcdef0123"),
+    ):
+        config.set_setting("defaults.aws_profile_name", "dcm-profile")
+        boto3_client_mock.return_value.list_farms.return_value = {"farms": []}
+
+        assert api.check_authentication_status() == api.AwsAuthenticationStatus.AUTHENTICATED
+        boto3_client_mock.return_value.list_farms.assert_called_once_with(
+            maxResults=1, principalId="user-1234"
+        )
 
 
 def test_get_check_authentication_status_configuration_error(fresh_deadline_config):
     """Confirm that check_authentication_status returns CONFIGURATION_ERROR"""
-    with patch.object(api._session, "get_boto3_session") as session_mock, patch.object(
-        api, "get_boto3_session", new=session_mock
+    with patch.object(api._session, "get_boto3_client") as boto3_client_mock, patch.object(
+        api._list_apis, "get_user_and_identity_store_id", return_value=(None, None)
     ):
         config.set_setting("defaults.aws_profile_name", "SomeRandomProfileName")
-        session_mock().client("sts").get_caller_identity.side_effect = Exception(
-            "some uncaught exception"
-        )
+        boto3_client_mock.return_value.list_farms.side_effect = Exception("some uncaught exception")
 
         assert api.check_authentication_status() == api.AwsAuthenticationStatus.CONFIGURATION_ERROR
 
@@ -111,7 +132,10 @@ def test_get_queue_user_boto3_session_no_profile(fresh_deadline_config):
         "botocore.session.Session", return_value=mock_botocore_session
     ), patch("boto3.Session") as boto3_session_mock:
         api.get_queue_user_boto3_session(
-            deadline_mock, farm_id="farm-1234", queue_id="queue-1234", queue_display_name="queue"
+            deadline_mock,
+            farm_id="farm-1234",
+            queue_id="queue-1234",
+            queue_display_name="queue",
         )
         boto3_session_mock.assert_called_once_with(
             botocore_session=ANY, profile_name=None, region_name="us-west-2"
@@ -128,6 +152,21 @@ def test_check_deadline_api_available(fresh_deadline_config):
         assert result is True
         # It should have called list_farms to check the API
         session_mock().client("deadline").list_farms.assert_called_once_with(maxResults=1)
+
+
+def test_check_deadline_api_available_injects_principal_id(fresh_deadline_config):
+    """For DCM profiles, check_deadline_api_available must pass principalId."""
+    with patch.object(api._session, "get_boto3_client") as boto3_client_mock, patch.object(
+        api._list_apis,
+        "get_user_and_identity_store_id",
+        return_value=("user-1234", "d-abcdef0123"),
+    ):
+        boto3_client_mock.return_value.list_farms.return_value = {"farms": []}
+
+        assert api.check_deadline_api_available() is True
+        boto3_client_mock.return_value.list_farms.assert_called_once_with(
+            maxResults=1, principalId="user-1234"
+        )
 
 
 def test_check_deadline_api_available_fails(fresh_deadline_config):
@@ -187,7 +226,7 @@ def test_precache_clients(mock_get_boto3_client, mock_get_queue_user_session, mo
     mock_get_boto3_client.assert_called_once_with("deadline", config=None)
     mock_deadline_client.get_queue.assert_called_once()
     mock_get_queue_user_session.assert_called_once()
-    mock_get_s3_client.assert_called_once_with(mock_session)
+    mock_get_s3_client.assert_called_once_with(mock_session, s3_max_pool_connections=50)
 
 
 @patch("deadline.client.api._session.get_s3_client")
@@ -226,7 +265,7 @@ def test_precache_clients_with_params(
     )
 
     # Verify S3 client was initialized with the session
-    mock_get_s3_client.assert_called_once_with(mock_session)
+    mock_get_s3_client.assert_called_once_with(mock_session, s3_max_pool_connections=50)
 
 
 def test_precache_clients_warms_asset_uploader_client(fresh_deadline_config):
@@ -238,7 +277,10 @@ def test_precache_clients_warms_asset_uploader_client(fresh_deadline_config):
     mock_deadline_client = MagicMock()
     mock_deadline_client.get_queue.return_value = {
         "displayName": "test-queue",
-        "jobAttachmentSettings": {"s3BucketName": "test-bucket", "rootPrefix": "test-prefix"},
+        "jobAttachmentSettings": {
+            "s3BucketName": "test-bucket",
+            "rootPrefix": "test-prefix",
+        },
     }
 
     # Use a real boto3 session for proper hashability
@@ -246,9 +288,11 @@ def test_precache_clients_warms_asset_uploader_client(fresh_deadline_config):
 
     # First, initialize the S3 client
     with patch(
-        "deadline.client.api._session.get_boto3_client", return_value=mock_deadline_client
+        "deadline.client.api._session.get_boto3_client",
+        return_value=mock_deadline_client,
     ), patch(
-        "deadline.client.api._session.get_queue_user_boto3_session", return_value=real_session
+        "deadline.client.api._session.get_queue_user_boto3_session",
+        return_value=real_session,
     ):
         # Get the client from initialization
         _, s3_client1 = precache_clients(farm_id="test-farm", queue_id="test-queue")
@@ -257,7 +301,11 @@ def test_precache_clients_warms_asset_uploader_client(fresh_deadline_config):
     from deadline.job_attachments.upload import S3AssetUploader
 
     # Create the uploader with the same session
-    uploader = S3AssetUploader(session=real_session)
+    uploader = S3AssetUploader(
+        session=real_session,
+        s3_max_pool_connections=50,
+        small_file_threshold_multiplier=20,
+    )
 
     # Get the client from the uploader
     s3_client2 = uploader._s3

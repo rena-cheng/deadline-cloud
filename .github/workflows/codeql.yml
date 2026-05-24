@@ -2,9 +2,9 @@ name: "CodeQL"
 
 on:
   push:
-    branches: [ "mainline" ]
+    branches: [ "mainline", "feature_*", "patch_*" ]
   pull_request:
-    branches: [ "mainline" ]
+    branches: [ "mainline", "feature_*", "patch_*" ]
   schedule:
     - cron: '0 8 * * MON'
 
@@ -12,3 +12,5 @@ jobs:
   Analysis:
     name: Analysis
     uses: aws-deadline/.github/.github/workflows/reusable_codeql.yml@mainline
+    permissions:
+      security-events: write

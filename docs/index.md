@@ -11,7 +11,6 @@ helpers around the service's API. It can function as a pipeline tool, a standalo
 Notable features include:
 
 * A command-line interface with subcommands for querying your AWS Deadline Cloud resources, and submitting jobs to your AWS Deadline Cloud Farm.
-* A library of functions that implement AWS Deadline Cloud's Job Attachments functionality.
 * A library of functions for creating a job submission UI within any content creation tool that supports Python 3.8+ based plugins and
   the Qt GUI framework.
 * A Model Context Protocol (MCP) server for AI assistant integration, enabling natural language interaction with AWS Deadline Cloud resources.
@@ -109,7 +108,8 @@ section of the AWS Deadline Cloud Developer Guide for detailed information on jo
 At a minimum, a job bundle is a folder that contains an [OpenJD][openjd] template as a file named `template.json` or `template.yaml`. However, it can optionally include:
 1. An `asset_references.yaml` file - lists file inputs and outputs.
 2. A `parameter_values.yaml` file - contains the selected values for the job template's parameters.
-3. Any number of additional files required for the job.
+3. A `hooks.yaml` file - defines pre/post-submission hooks (see [Submission Hooks](submission-hooks.md)).
+4. Any number of additional files required for the job.
 
 For example job bundles, visit the [samples repository][deadline-cloud-samples].
 
@@ -141,7 +141,7 @@ $ deadline config show --output json
 ```
 Which will output:
 ```sh
-{"settings.config_file_path": "~/.deadline/config", "deadline-cloud-monitor.path": "", "defaults.aws_profile_name": "(default)", "settings.job_history_dir": "~/.deadline/job_history/(default)", "defaults.farm_id": "", "settings.storage_profile_id": "", "defaults.queue_id": "", "defaults.job_id": "", "settings.auto_accept": "false", "settings.conflict_resolution": "NOT_SELECTED", "settings.log_level": "WARNING", "telemetry.opt_out": "false", "telemetry.identifier": "00000000-0000-0000-0000-000000000000", "defaults.job_attachments_file_system": "COPIED", "settings.s3_max_pool_connections": "50", "settings.small_file_threshold_multiplier": "20"}
+{"settings.config_file_path": "~/.deadline/config", "deadline-cloud-monitor.path": "", "defaults.aws_profile_name": "(default)", "settings.job_history_dir": "~/.deadline/job_history/(default)", "defaults.farm_id": "", "settings.storage_profile_id": "", "defaults.queue_id": "", "defaults.job_id": "", "settings.auto_accept": "false", "settings.conflict_resolution": "NOT_SELECTED", "settings.log_level": "WARNING", "telemetry.opt_out": "false", "telemetry.identifier": "", "defaults.job_attachments_file_system": "COPIED", "settings.s3_max_pool_connections": "50", "settings.small_file_threshold_multiplier": "20", "settings.known_asset_paths": "", "settings.locale": "", "settings.force_s3_check": "false", "settings.allow_bundle_hooks": "false", "settings.allow_environment_hooks": "false", "settings.submitter_update_notification": "true", "settings.max_retries_per_task": "5", "settings.max_failed_tasks_count": "20"}
 ```
 
 To see a list of settings that can be configured, run:
@@ -155,6 +155,11 @@ $ deadline config gui
 ```
 
 By default, configuration of AWS Deadline Cloud is provided at `~/.deadline/config`, however this can be overridden by the `DEADLINE_CONFIG_FILE_PATH` environment variable.
+
+Submitter integrations check for newer versions on startup. To deactivate these notifications:
+```sh
+$ deadline config set settings.submitter_update_notification false
+```
 
 ## Authentication
 
@@ -233,13 +238,16 @@ $ deadline job logs --session-id session-12345 --start-time 2023-01-01T12:00:00Z
 $ deadline job logs --session-id session-12345 --output json
 
 # Get logs with timestamps in local timezone (default is UTC)
-$ deadline job logs --session-id session-12345 --timezone local
+$ deadline job logs --session-id session-12345 --timestamp-format local
 
 # Get logs with explicit UTC timestamps (default behavior)
-$ deadline job logs --session-id session-12345 --timezone utc
+$ deadline job logs --session-id session-12345 --timestamp-format utc
 
-# Combine timezone option with JSON output
-$ deadline job logs --session-id session-12345 --timezone local --output json
+# Get logs with relative timestamps
+$ deadline job logs --session-id session-12345 --timestamp-format relative
+
+# Combine timestamp format option with JSON output
+$ deadline job logs --session-id session-12345 --timestamp-format local --output json
 
 # Paginate through logs
 $ deadline job logs --session-id session-12345 --next-token next-token-value
@@ -249,9 +257,10 @@ $ deadline job logs --session-id session-12345 --next-token next-token-value
 - UTC format: `2025-07-03T10:49:33.821306+00:00`
 - Local format: `2025-07-03T03:49:33.821306-07:00` (example for PST)
 
-**Timezone Options**:
-- `--timezone utc` (default): Display timestamps in UTC with `+00:00` offset
-- `--timezone local`: Display timestamps converted to your local system timezone
+**Timestamp Format Options**:
+- `--timestamp-format utc` (default): Display timestamps in UTC with `+00:00` offset
+- `--timestamp-format local`: Display timestamps converted to your local system timezone
+- `--timestamp-format relative`: Display timestamps relative to the session or session action start time
 
 When using a Deadline Cloud monitor profile, the `job logs` command will use the Queue role credentials to read logs. Otherwise, the chosen profile credentials are used for all API invocations. This allows you to access logs with the appropriate permissions based on your authentication method.
 

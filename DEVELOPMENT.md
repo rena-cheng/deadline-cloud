@@ -3,19 +3,37 @@
 This documentation provides guidance on developer workflows for working with the code in this repository.
 
 Table of Contents:
-* [Development Environment Setup](#development-environment-setup)
-* [The Development Loop](#the-development-loop)
-* [Documentation](#documentation)
-   * [Code Organization](#code-organization)
-* [Testing](#testing)
-   * [Writing tests](#writing-tests)
-   * [Unit tests](#unit-tests)
-   * [Integration tests](#integration-tests)
-   * [Squish GUI Submitter tests](#squish-tests)
-* [Things to Know](#things-to-know)
-   * [Public contracts](#public-contracts)
-   * [Library Dependencies](#dependencies)
-   * [Qt and Calling AWS APIs](#qt-and-calling-aws-including-aws-deadline-cloud-apis)
+- [Development documentation](#development-documentation)
+  - [Development Environment Setup](#development-environment-setup)
+  - [The Development Loop](#the-development-loop)
+  - [Documentation](#documentation)
+    - [Code Organization](#code-organization)
+  - [Testing](#testing)
+    - [Writing Tests](#writing-tests)
+    - [Unit Tests](#unit-tests)
+      - [Running Unit Tests](#running-unit-tests)
+      - [Running Docker-based Unit Tests](#running-docker-based-unit-tests)
+    - [Integration Tests](#integration-tests)
+      - [Running Integration Tests](#running-integration-tests)
+    - [GUI Tests (pytest-qt)](#gui-tests-pytest-qt)
+      - [Running GUI Tests](#running-gui-tests)
+    - [UI Tests](#ui-tests)
+      - [Running UI Tests](#running-ui-tests)
+  - [Changelog Guidelines](#changelog-guidelines)
+  - [Things to Know](#things-to-know)
+    - [Public Contracts](#public-contracts)
+      - [Private Modules](#private-modules)
+      - [Public Modules](#public-modules)
+      - [On `import os as _os`](#on-import-os-as-_os)
+    - [Library Dependencies](#library-dependencies)
+      - [Why is a new dependency needed?](#why-is-a-new-dependency-needed)
+      - [Quality of the dependency](#quality-of-the-dependency)
+      - [Version Pinning](#version-pinning)
+      - [Licensing](#licensing)
+    - [Qt and Calling AWS (including AWS Deadline Cloud) APIs](#qt-and-calling-aws-including-aws-deadline-cloud-apis)
+    - [Pattern 1: Simple Async Operations (Recommended)](#pattern-1-simple-async-operations-recommended)
+    - [Pattern 2: Long-Running Operations with Progress](#pattern-2-long-running-operations-with-progress)
+- [Profiling in Deadline Cloud](#profiling-in-deadline-cloud)
 
 ## Development Environment Setup
 
@@ -27,16 +45,6 @@ To develop the Python code in this repository you will need:
 
 You can develop on a Linux, MacOS, or Windows workstation, but you may find that some of the support scripting is specific to
 Linux/MacOS workstations.
-
-If you are making changes to the Job Attachments files, then you will also need the following to be able to run the integration
-tests:
-
-1. A valid AWS Account
-2. An AWS Deadline Cloud Farm and Queue.
-   *  You can create these via AWS Deadline Cloud's AWS Console quick Farm create workflow.
-      The Queue's configuration must include a Job Attachments bucket. If used only for running these tests then the cost of
-      this infrastructure should be negligible, but do keep an eye on your costs and destroy the infrastructure (especially S3 buckets)
-      when you no longer need it.
 
 ## The Development Loop
 
@@ -62,7 +70,7 @@ process along the lines of the following as a starting point:
    Iteratively improve your implementation until all unit tests pass. (See [Unit tests](#unit-tests))
 3. Add integration tests for your changes if applicable. Ensure that all integration tests pass.
    Iteratively improve your implementation until all integration and unit tests pass. (See [Integration tests](#integration-tests))
-4. Add Squish GUI tests for your changes if applicable. Ensure that all Squish GUI tests pass. (See [Squish GUI tests](#squish-tests))
+4. Add pytest-qt GUI unit tests for widget/dialog behavior, or UI tests for full workflow verification. (See [GUI Tests (pytest-qt)](#gui-tests-pytest-qt) and [UI Tests](#ui-tests))
 
 Once you are satisfied with your code, and all relevant tests pass, then run `hatch run fmt` to fix up the formatting of
 your code and post your pull request.
@@ -97,7 +105,9 @@ The tests for this package have three forms:
    without requiring an AWS account.
 2. Integration tests - Tests that ensure that the implementation behaves as expected when run in a real environment.
    Ensuring that code properly interacts as expected with a real Amazon S3 bucket, for instance.
-3. Squish GUI Submitter tests - Tests that verify the Deadline GUI using Squish automated framework. Squish tests require a license.
+3. GUI unit tests - Tests that verify individual Deadline GUI widgets and dialogs using [pytest-qt](https://pytest-qt.readthedocs.io/).
+   These run as part of the unit test suite, use MockDeadlineBackend for API responses, and require no AWS account.
+4. UI tests - Subprocess-based tests that launch the real `deadline` GUI commands and drive them through the OS accessibility tree, verifying the UI renders the right widgets and responds correctly. See [UI Tests](#ui-tests).
 
 ### Writing Tests
 
@@ -135,8 +145,6 @@ Some of the unit tests in this package require a docker environment to run. Thes
 In order to run these tests, please run the `run_sudo_tests.sh` script located in the `scripts` directory. For detailed instructions,
 please refer to [scripts/README.md](./scripts/README.md).
 
-If you make changes to the `download` or `asset_sync` modules, it's highly recommended to run and ensure these tests pass.
-
 ### Integration Tests
 
 Integration tests are all located under the `test/integ` directory of this repository. You should consider
@@ -145,9 +153,10 @@ interfaces with the local filesystem or an AWS service API.
 
 #### Running Integration Tests
 
-Our integration tests run using using infrastructure that is in your AWS Account. The identifiers for
-these resources are communicated to the tests through environment variables that you must define before running
-the tests. Define the following environment variables:
+Our integration tests run using infrastructure that is in your AWS Account. A Farm, Queue and Fleet (that associated with 
+the Queue) will be required to run the integration tests. The identifiers for these resources are communicated to the 
+tests through environment variables that you must define before running the tests. Define the following environment 
+variables:
 
 ```bash
 # Replace with your AWS Account ID
@@ -179,25 +188,42 @@ hatch run integ:test
 Notes:
 * If you are not one of the AWS Deadline Cloud developers then you may see test failures in tests marked with
   `pytest.mark.cross_account`. That's okay, just ignore them; they'll be tested with the required setup in our CI.
-* If you are adding/changing code related to the Job Attachments' file-upload interactions with S3, then if you have a second
-  AWS account then we request that you also ensure that the tests marked with the `pytest.mark.cross_account` marker also pass.
-  If you don't have a second account, then don't worry about it. These tests will run in our CI. To run these tests:
-  1. Create an S3 bucket in the same region as your testing resources but in your second AWS Account. If the bucket doesn't exist, you may see S3 PermanentRedirect error.
-  2. Set the access policy of that S3 bucket to allow your first AWS Account to perform all operations on the bucket. Do
-     NOT open the bucket up to the world for reading/writing!
-  3. `export INTEG_TEST_JA_CROSS_ACCOUNT_BUCKET=<your-bucket-name-in-the-second-account>`
-  4. Run the integration tests.
 * AWS Developers note: If testing with a non-production deployment of AWS Deadline Cloud then you will have to
 define the `AWS_ENDPOINT_URL_DEADLINE` environment variable to the non-production endpoint URL. For example,
 production endpoints look like: `export AWS_ENDPOINT_URL_DEADLINE="https://deadline.$AWS_DEFAULT_REGION.amazonaws.com"`
 
-### Squish GUI Submitter Tests
+### GUI Tests (pytest-qt)
 
-Squish GUI tests are located under the `test/squish` directory of this repository. New tests can be added for the Deadline GUI when necessary (ie: new functionality is introduced and a test can be added for coverage, or existing functionality is modified). When changes are made, Squish automated tests should be run to ensure changes are not breaking Deadline CLI and GUI functionality.
+GUI tests are located under `test/unit/deadline_client/ui/gui/`. They use [pytest-qt](https://pytest-qt.readthedocs.io/) to test Qt widgets and dialogs in-process, with `MockDeadlineBackend` providing fake API responses. No AWS credentials required.
 
-#### Running Squish GUI Submitter Tests
+#### Running GUI Tests
 
-A separate ReadMe for developing/running Squish GUI tests is located in the `test/squish` directory. Please refer to [test/squish/SQUISH_README.md](./test/squish/SQUISH_README.md) on full instructions to use the automated tests. Note that a Squish license is required in order to run the tests. Currently, you may either have your own Squish license or you may file a [pull request](https://help.github.com/articles/creating-a-pull-request/) to the Deadline Cloud team to run or add any tests against any changes to be committed. Please perform any necessary manual tests prior to submitting any changes, in addition to making sure at least a minimal render job test passes.
+```sh
+hatch run test test/unit/deadline_client/ui/gui/
+```
+
+These tests run automatically in CI as part of the standard unit test suite.
+
+### UI Tests
+
+UI tests are located under the `test/ui` directory of this repository. They launch the real `deadline` GUI commands as a subprocess against an in-process mock Deadline backend and drive the GUI through the OS accessibility tree via [xa11y](https://xa11y.dev/). New UI tests can be added for new dialogs/widgets or to cover regressions in existing GUI behavior. See [test/README.md](./test/README.md) for the full testing layer guide.
+
+#### Running UI Tests
+
+```bash
+hatch run ui:test
+```
+
+## Changelog Guidelines
+
+When a new version of `deadline` is being released, we must prepare an update to our change log (`CHANGELOG.md`). This is a semi-automated process. GitHub actions prepares a pull request with an automatically generated draft of the changelog entry. Maintainers are responsible for reviewing the draft, making any necessary changes, and reviewing the changes in the pull request. Please consult in [CHANGELOG_GUIDELINES.md](./CHANGELOG_GUIDELINES.md) for the changelog guidelines. These guidelines ensure consistency in how we communicate changes to users and provide standards for:
+
+* Structuring changelog sections and their ordering
+* Writing user-focused descriptions for different types of changes
+* Handling breaking changes with proper migration guidance
+* Communicating deprecations effectively
+* Managing fixes to unreleased changes
+* Documenting changes to experimental features
 
 ## Things to Know
 
@@ -226,6 +252,87 @@ For the Python library interface:
   de-facto parts of the public contract as users build automation that assumes these locations is unchanged.
 
 Note that we enforce our public contract through GitHub actions. See the [API Change Detection section](scripts/README.md#api-change-detection) in the scripts README for more information about generating and validating API changes.
+
+#### Private Modules
+
+New code should reside in private modules (example: `_my_module.py`), which removes the need to mark imports, classes, and functions as private with an underscore.
+
+```python
+# _my_module.py
+import os
+
+class PublicClass:
+    def publicmethod(self):
+        pass
+    # We still need to mark this as private, since the class will be public
+    def _privatemethod(self):
+        pass
+
+class PrivateClass:
+    def privatemethod(self):
+        pass
+```
+
+Public contracts in private modules are defined by imports in the corresponding `__init__.py` in the same directory as the private module.
+
+```python
+# __init__.py
+
+from _my_module import PublicClass
+```
+
+#### Public Modules
+
+A public module (for example `my_module.py`) in this package will be defined with the following style:
+
+```python
+# my_module.py
+
+# The os module is not part of this file's external interface
+import os as _os
+
+# PublicClass is part of this file's external interface.
+class PublicClass:
+    def publicmethod(self):
+        pass
+
+    def _privatemethod(self):
+        pass
+
+# _PrivateClass is not part of this file's external interface.
+class _PrivateClass:
+    def publicmethod(self):
+        pass
+
+    def _privatemethod(self):
+        pass
+```
+
+#### On `import os as _os`
+
+Every module/symbol that is imported into a Python module becomes a part of that module's interface.
+Thus, if we have a module called `foo.py` such as:
+
+```python
+# foo.py
+
+import os
+```
+
+Then, the `os` module becomes part of the public interface for `foo.py` and a consumer of that module
+is free to do:
+
+```python
+from foo import os
+```
+
+We don't want all (generally, we don't want any) of our imports to become part of the public API for
+the module, so we import modules/symbols into a public module with the following style:
+
+```python
+import os as _os
+from typing import Dict as _Dict
+```
 
 ### Library Dependencies
 
@@ -284,66 +391,89 @@ for a signal from the application.
 If interacting with the GUI can start multiple background threads, you should also track which
 is the latest, so the code only applies the result of the newest operation.
 
-See `deadline_config_dialog.py` for some examples that do all of the above. Here's some
-code that was edited to show how it fits together:
+See `deadline_config_dialog.py` for some examples that do all of the above.
+
+### Pattern 1: Simple Async Operations (Recommended)
+
+For simple fetch-and-display operations, use `AsyncTaskRunner`:
 
 ```python
+from deadline.client.ui.controllers import AsyncTaskRunner
+
 class MyCustomWidget(QWidget):
-   # Signals for the widget to receive from the thread
-   background_exception = Signal(str, BaseException)
-   update = Signal(int, BackgroundResult)
-
-   def __init__(self, ...):
-      # Save information about the thread
-      self.__refresh_thread = None
-      self.__refresh_id = 0
-
-      # Use the CancelationFlag object to decouple the cancelation value
-      # from the window lifetime.
-      self.canceled = CancelationFlag()
-      self.destroyed.connect(self.canceled.set_canceled)
-
-      # Connect the Signals to handler functions that run on the main thread
-      self.update.connect(self.handle_update)
-      self.background_exception.connect(self.handle_background_exception)
-
-   def handle_background_exception(self, e: BaseException):
-      # Handle the error
-      QMessageBox.warning(...)
-
-   def handle_update(self, refresh_id: int, result: BackgroundResult):
-      # Apply the refresh if it's still for the latest call
-      if refresh_id == self.__refresh_id:
-         # Do something with result
-         self.result_widget.set_message(result)
+    def __init__(self, ...):
+        self._runner = AsyncTaskRunner(self)
+        self._runner.task_error.connect(self._on_error, Qt.QueuedConnection)
 
     def start_the_refresh(self):
-        # This function starts the thread to run in the background
-
-        # Update the GUI state to reflect the update
         self.result_widget.set_refreshing_status(True)
-
-        self.__refresh_id += 1
-        self.__refresh_thread = threading.Thread(
-            target=self._refresh_thread_function,
-            name=f"AWS Deadline Cloud Refresh Thread",
-            args=(self.__refresh_id,),
+        self._runner.run(
+            operation_key="my_refresh",
+            fn=self._fetch_data,
+            on_success=self._handle_result,
+            on_error=self._handle_error,
         )
-        self.__refresh_thread.start()
 
-   def _refresh_thread_function(self, refresh_id: int):
-      # This function is for the background thread
-      try:
-         # Call the slow operations
-         result = boto3_client.potentially_expensive_api(...)
-         # Only emit the result if it isn't canceled
-         if not self.canceled:
-            self.update.emit(refresh_id, result)
-      except BaseException as e:
-         # Use multiple signals for different meanings, such as handling errors.
-         if not self.canceled:
-            self.background_exception.emit(f"Background thread error", e)
+    def _fetch_data(self):
+        # This runs in background thread
+        return boto3_client.potentially_expensive_api(...)
 
+    def _handle_result(self, result):
+        self.result_widget.set_refreshing_status(False)
+        self.result_widget.set_message(result)
+
+    def _handle_error(self, error):
+        self.result_widget.set_refreshing_status(False)
+        QMessageBox.warning(self, "Error", str(error))
+```
+
+### Pattern 2: Long-Running Operations with Progress
+
+For complex operations with progress callbacks, use a `QThread` subclass:
+
+```python
+from qtpy.QtCore import QThread, Signal, Qt
+
+class MyWorker(QThread):
+    progress = Signal(int, str)  # percent, message
+    succeeded = Signal(object)
+    failed = Signal(BaseException)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._canceled = False
+
+    def cancel(self):
+        self._canceled = True
+
+    def run(self):
+        try:
+            for i, item in enumerate(items):
+                if self._canceled:
+                    return
+                self.progress.emit(i * 100 // len(items), f"Processing {item}")
+                process(item)
+            self.succeeded.emit(result)
+        except Exception as e:
+            if not self._canceled:
+                self.failed.emit(e)
+
+
+class MyCustomWidget(QWidget):
+    def __init__(self, ...):
+        self._worker = MyWorker(self)
+        self._worker.progress.connect(self._on_progress, Qt.QueuedConnection)
+        self._worker.succeeded.connect(self._on_success, Qt.QueuedConnection)
+        self._worker.failed.connect(self._on_error, Qt.QueuedConnection)
+
+    def start_the_operation(self):
+        self._worker.start()
+
+    def closeEvent(self, event):
+        if self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait()
+        super().closeEvent(event)
 ```
 
 # Profiling in Deadline Cloud

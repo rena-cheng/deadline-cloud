@@ -4,6 +4,7 @@
 Tests for the CLI job commands.
 """
 
+from datetime import timezone
 import datetime
 import json
 import os
@@ -26,6 +27,10 @@ from deadline.client.cli._groups.job_group import (
     _get_json_line,
     _get_download_summary_message,
 )
+from deadline.client.cli._groups._job_helpers import (
+    _format_duration,
+    _estimate_remaining_time,
+)
 from deadline.client.exceptions import DeadlineOperationError, DeadlineOperationTimedOut
 from deadline.job_attachments.models import (
     FileConflictResolution,
@@ -45,8 +50,6 @@ from ..shared_constants import (
     MOCK_SESSION_ACTION_ID,
     MOCK_STEP_ID,
     MOCK_TASK_ID,
-    MOCK_FLEET_ID,
-    MOCK_WORKER_ID,
 )
 
 MOCK_JOBS_LIST = [
@@ -73,69 +76,6 @@ MOCK_JOBS_LIST = [
         "priority": 50,
     },
 ]
-
-MOCK_SESSIONS_LIST = [
-    {
-        "sessionId": "session-1",
-        "fleetId": MOCK_FLEET_ID,
-        "workerId": MOCK_WORKER_ID,
-        "startedAt": datetime.datetime(2023, 1, 27, 7, 24, 22, tzinfo=tzutc()),
-        "lifecycleStatus": "ENDED",
-        "endedAt": datetime.datetime(2023, 1, 27, 7, 25, 22, tzinfo=tzutc()),
-    },
-]
-
-MOCK_SESSION_ACTIONS_LIST = [
-    {
-        "sessionActionId": "sessionaction-1-0",
-        "status": "SUCCEEDED",
-        "startedAt": datetime.datetime(2023, 1, 27, 7, 24, 45, tzinfo=tzutc()),
-        "endedAt": datetime.datetime(2023, 1, 27, 7, 25, 15, tzinfo=tzutc()),
-        "progressPercent": 100.0,
-        "definition": {
-            "taskRun": {
-                "taskId": "task-0a0ac395f3ed4d61bda7019874b1f384-0",
-                "stepId": "step-0a0ac395f3ed4d61bda7019874b1f384",
-            }
-        },
-    },
-]
-
-MOCK_STEP = {
-    "stepId": "step-0a0ac395f3ed4d61bda7019874b1f384",
-    "name": "Step Name",
-    "lifecycleStatus": "CREATE_COMPLETE",
-    "taskRunStatus": "SUCCEEDED",
-    "taskRunStatusCounts": {
-        "PENDING": 0,
-        "READY": 0,
-        "RUNNING": 0,
-        "ASSIGNED": 0,
-        "STARTING": 0,
-        "SCHEDULED": 0,
-        "INTERRUPTING": 0,
-        "SUSPENDED": 0,
-        "CANCELED": 0,
-        "FAILED": 0,
-        "SUCCEEDED": 1,
-    },
-    "createdAt": datetime.datetime(2023, 1, 27, 7, 14, 41, tzinfo=tzutc()),
-    "createdBy": "a4a874f8-10b1-70d6-e763-a0e3822893b0",
-    "startedAt": datetime.datetime(2023, 1, 27, 7, 24, 45, tzinfo=tzutc()),
-    "endedAt": datetime.datetime(2023, 1, 27, 7, 25, 15, tzinfo=tzutc()),
-}
-
-MOCK_TASK = {
-    "taskId": "task-0a0ac395f3ed4d61bda7019874b1f384-2",
-    "createdAt": datetime.datetime(2023, 1, 27, 7, 14, 41, tzinfo=tzutc()),
-    "createdBy": "a4a874f8-10b1-70d6-e763-a0e3822893b0",
-    "runStatus": "SUCCEEDED",
-    "failureRetryCount": 0,
-    "parameters": {},
-    "startedAt": datetime.datetime(2023, 1, 27, 7, 24, 45, tzinfo=tzutc()),
-    "endedAt": datetime.datetime(2023, 1, 27, 7, 25, 15, tzinfo=tzutc()),
-    "latestSessionActionId": "sessionaction-1-0",
-}
 
 os.environ["AWS_ENDPOINT_URL_DEADLINE"] = "https://fake-endpoint"
 
@@ -169,6 +109,7 @@ def test_cli_job_list(fresh_deadline_config):
   endedAt: 2023-01-27 07:39:17+00:00
   createdBy: b801f3c0-c071-70bc-b869-6804bc732408
   createdAt: 2023-01-27 07:34:41+00:00
+  estimatedTimeRemaining: N/A
 - name: CLI Job
   jobId: job-0d239749fa05435f90263b3a8be54144
   taskRunStatus: COMPLETED
@@ -176,6 +117,7 @@ def test_cli_job_list(fresh_deadline_config):
   endedAt: 2023-01-27 07:29:51+00:00
   createdBy: b801f3c0-c071-70bc-b869-6804bc732408
   createdAt: 2023-01-27 07:24:22+00:00
+  estimatedTimeRemaining: N/A
 
 """
         )
@@ -211,6 +153,7 @@ def test_cli_job_list_explicit_farm_and_queue_id(fresh_deadline_config):
   endedAt: 2023-01-27 07:39:17+00:00
   createdBy: b801f3c0-c071-70bc-b869-6804bc732408
   createdAt: 2023-01-27 07:34:41+00:00
+  estimatedTimeRemaining: N/A
 - name: CLI Job
   jobId: job-0d239749fa05435f90263b3a8be54144
   taskRunStatus: COMPLETED
@@ -218,6 +161,7 @@ def test_cli_job_list_explicit_farm_and_queue_id(fresh_deadline_config):
   endedAt: 2023-01-27 07:29:51+00:00
   createdBy: b801f3c0-c071-70bc-b869-6804bc732408
   createdAt: 2023-01-27 07:24:22+00:00
+  estimatedTimeRemaining: N/A
 
 """
         )
@@ -340,6 +284,7 @@ startedAt: 2023-01-27 07:37:53+00:00
 endedAt: 2023-01-27 07:39:17+00:00
 priority: 50
 
+estimatedTimeRemaining: N/A
 """
         )
         session_mock().client("deadline").get_job.assert_called_once_with(
@@ -371,10 +316,14 @@ def test_cli_job_download_output_stdout_with_only_required_input(
             processed_files=3,
             processed_bytes=1024,
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
+        MockOutputDownloader.return_value.download = mock_download
         mock_root_path = "/root/path" if sys.platform != "win32" else "C:\\Users\\username"
-        mock_files_list = ["outputs/file1.txt", "outputs/file2.txt", "outputs/file3.txt"]
-        MockOutputDownloader.return_value.get_output_paths_by_root.side_effect = [
+        mock_files_list = [
+            "outputs/file1.txt",
+            "outputs/file2.txt",
+            "outputs/file3.txt",
+        ]
+        MockOutputDownloader.return_value.get_paths_by_root.side_effect = [
             {
                 f"{mock_root_path}": mock_files_list,
                 f"{mock_root_path}2": mock_files_list,
@@ -426,6 +375,7 @@ def test_cli_job_download_output_stdout_with_only_required_input(
             task_id=None,
             session_action_id=None,
             session=ANY,
+            include_filters=None,
         )
 
         path_separator = "/" if sys.platform != "win32" else "\\"
@@ -483,11 +433,15 @@ def test_cli_job_download_output_stdout_with_mismatching_path_format(
             processed_files=3,
             processed_bytes=1024,
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
+        MockOutputDownloader.return_value.download = mock_download
 
         mock_root_path = "C:\\Users\\username" if sys.platform != "win32" else "/root/path"
-        mock_files_list = ["outputs/file1.txt", "outputs/file2.txt", "outputs/file3.txt"]
-        MockOutputDownloader.return_value.get_output_paths_by_root.side_effect = [
+        mock_files_list = [
+            "outputs/file1.txt",
+            "outputs/file2.txt",
+            "outputs/file3.txt",
+        ]
+        MockOutputDownloader.return_value.get_paths_by_root.side_effect = [
             {
                 f"{mock_root_path}": mock_files_list,
             },
@@ -535,6 +489,7 @@ def test_cli_job_download_output_stdout_with_mismatching_path_format(
             task_id=None,
             session_action_id=None,
             session=ANY,
+            include_filters=None,
         )
 
         path_separator = "/" if sys.platform != "win32" else "\\"
@@ -584,12 +539,16 @@ def test_cli_job_download_output_handles_unc_path_on_windows(fresh_deadline_conf
             processed_files=3,
             processed_bytes=1024,
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
+        MockOutputDownloader.return_value.download = mock_download
 
         # UNC format (which refers to the same location as 'C:\Users\username')
         mock_root_path = "\\\\127.0.0.1\\c$\\Users\\username"
-        mock_files_list = ["outputs/file1.txt", "outputs/file2.txt", "outputs/file3.txt"]
-        MockOutputDownloader.return_value.get_output_paths_by_root.side_effect = [
+        mock_files_list = [
+            "outputs/file1.txt",
+            "outputs/file2.txt",
+            "outputs/file3.txt",
+        ]
+        MockOutputDownloader.return_value.get_paths_by_root.side_effect = [
             {
                 f"{mock_root_path}": mock_files_list,
             },
@@ -631,6 +590,7 @@ def test_cli_job_download_output_handles_unc_path_on_windows(fresh_deadline_conf
             task_id=None,
             session_action_id=None,
             session=ANY,
+            include_filters=None,
         )
 
         path_separator = "/" if sys.platform != "win32" else "\\"
@@ -680,8 +640,8 @@ def test_cli_job_download_no_output_stdout(fresh_deadline_config, tmp_path: Path
             processed_files=3,
             processed_bytes=1024,
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
-        MockOutputDownloader.return_value.get_output_paths_by_root.return_value = {}
+        MockOutputDownloader.return_value.download = mock_download
+        MockOutputDownloader.return_value.get_paths_by_root.return_value = {}
 
         mock_host_path_format_name = PathFormat.get_host_path_format_string()
         boto3_client_mock().get_job.return_value = {
@@ -714,6 +674,7 @@ def test_cli_job_download_no_output_stdout(fresh_deadline_config, tmp_path: Path
             task_id=None,
             session_action_id=None,
             session=ANY,
+            include_filters=None,
         )
 
         assert (
@@ -743,16 +704,25 @@ def test_cli_job_download_output_stdout_with_json_format(
     ), patch.object(job_group, "_assert_valid_path", return_value=None), patch.object(
         api, "get_queue_user_boto3_session"
     ):
+        mock_root_path = "/root/path" if sys.platform != "win32" else "C:\\Users\\username"
         mock_download = MagicMock()
         mock_download.return_value = DownloadSummaryStatistics(
             total_time=12,
             processed_files=3,
             processed_bytes=1024,
+            downloaded_files=[
+                f"{mock_root_path}/outputs/file1.txt",
+                f"{mock_root_path}/outputs/file2.txt",
+                f"{mock_root_path}/outputs/file3.txt",
+            ],
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
-        mock_root_path = "/root/path" if sys.platform != "win32" else "C:\\Users\\username"
-        mock_files_list = ["outputs/file1.txt", "outputs/file2.txt", "outputs/file3.txt"]
-        MockOutputDownloader.return_value.get_output_paths_by_root.side_effect = [
+        MockOutputDownloader.return_value.download = mock_download
+        mock_files_list = [
+            "outputs/file1.txt",
+            "outputs/file2.txt",
+            "outputs/file3.txt",
+        ]
+        MockOutputDownloader.return_value.get_paths_by_root.side_effect = [
             {
                 f"{mock_root_path}": mock_files_list,
                 f"{mock_root_path}2": mock_files_list,
@@ -806,37 +776,57 @@ def test_cli_job_download_output_stdout_with_json_format(
             task_id=None,
             session_action_id=None,
             session=ANY,
+            include_filters=None,
         )
 
-        expected_json_title = json.dumps({"messageType": "title", "value": "Mock Job"})
-        expected_json_presummary = json.dumps(
-            {
-                "messageType": "presummary",
-                "value": {
-                    mock_root_path: [
-                        "outputs/file1.txt",
-                        "outputs/file2.txt",
-                        "outputs/file3.txt",
-                    ],
-                    f"{mock_root_path}2": [
-                        "outputs/file1.txt",
-                        "outputs/file2.txt",
-                        "outputs/file3.txt",
-                    ],
-                },
-            }
-        )
-        expected_json_path = json.dumps(
-            {"messageType": "path", "value": [mock_root_path, f"{mock_root_path}2"]}
-        )
-        expected_json_pathconfirm = json.dumps(
-            {"messageType": "pathconfirm", "value": [mock_root_path, str(tmp_path)]}
-        )
+        expected_json_title = {"messageType": "title", "value": "Mock Job"}
+        expected_json_presummary = {
+            "messageType": "presummary",
+            "value": {
+                mock_root_path: [
+                    "outputs/file1.txt",
+                    "outputs/file2.txt",
+                    "outputs/file3.txt",
+                ],
+                f"{mock_root_path}2": [
+                    "outputs/file1.txt",
+                    "outputs/file2.txt",
+                    "outputs/file3.txt",
+                ],
+            },
+        }
+        expected_json_path = {
+            "messageType": "path",
+            "value": [mock_root_path, f"{mock_root_path}2"],
+        }
+        expected_json_pathconfirm = {
+            "messageType": "pathconfirm",
+            "value": [mock_root_path, str(tmp_path)],
+        }
 
-        assert (
-            f"{expected_json_title}\n{expected_json_presummary}\n{expected_json_path}\n {expected_json_pathconfirm}\n"
-            in result.output
-        )
+        parsed_lines = []
+        for line in result.output.strip().split("\n"):
+            if line.strip():
+                try:
+                    parsed_lines.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Command can output non-JSON lines e.g. telemetry errors. Ignore lines that aren't valid JSON
+                    pass
+        assert expected_json_title in parsed_lines
+        assert expected_json_presummary in parsed_lines
+        assert expected_json_path in parsed_lines
+        assert expected_json_pathconfirm in parsed_lines
+
+        # Verify the summary includes the files list
+        summary_messages = [msg for msg in parsed_lines if msg.get("messageType") == "summary"]
+        assert len(summary_messages) == 1
+        assert summary_messages[0]["fileCount"] == 3
+        assert summary_messages[0]["files"] == [
+            f"{mock_root_path}/outputs/file1.txt",
+            f"{mock_root_path}/outputs/file2.txt",
+            f"{mock_root_path}/outputs/file3.txt",
+        ]
+
         assert result.exit_code == 0
 
 
@@ -853,7 +843,10 @@ def test_cli_job_download_output_stdout_with_json_format(
         ),
         (
             {
-                "/home/username/project01": ["renders/image1.png", "renders/image2.png"],
+                "/home/username/project01": [
+                    "renders/image1.png",
+                    "renders/image2.png",
+                ],
                 "/home/username/project02": [
                     "renders/image1.png",
                     "renders/image2.png",
@@ -1104,7 +1097,9 @@ def test_cli_job_wait_not_compatible(fresh_deadline_config):
         assert result.exit_code == 5
 
 
-def test_cli_job_wait_succeeded_with_failed_tasks_returns_exit_code_2(fresh_deadline_config):
+def test_cli_job_wait_succeeded_with_failed_tasks_returns_exit_code_2(
+    fresh_deadline_config,
+):
     """
     Test that job wait command returns exit code 2 when there are failed tasks, even if status is SUCCEEDED.
     """
@@ -1329,7 +1324,9 @@ def test_cli_job_wait_error_handling_json_output(fresh_deadline_config):
         assert result.exit_code == 2
 
 
-def test_cli_job_download_output_handle_web_url_with_optional_input(fresh_deadline_config):
+def test_cli_job_download_output_handle_web_url_with_optional_input(
+    fresh_deadline_config,
+):
     """
     Confirm that the CLI interface prints out the expected list of
     farms, given mock data.
@@ -1347,7 +1344,7 @@ def test_cli_job_download_output_handle_web_url_with_optional_input(fresh_deadli
             processed_files=3,
             processed_bytes=1024,
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
+        MockOutputDownloader.return_value.download = mock_download
         mock_host_path_format_name = PathFormat.get_host_path_format_string()
 
         boto3_client_mock().get_job.return_value = {
@@ -1396,6 +1393,7 @@ def test_cli_job_download_output_handle_web_url_with_optional_input(fresh_deadli
             task_id="task-2",
             session_action_id=MOCK_SESSION_ACTION_ID,
             session=ANY,
+            include_filters=None,
         )
         mock_download.assert_called_once_with(
             file_conflict_resolution=FileConflictResolution.CREATE_COPY,
@@ -1404,71 +1402,10 @@ def test_cli_job_download_output_handle_web_url_with_optional_input(fresh_deadli
         assert result.exit_code == 0
 
 
-def test_cli_job_trace_schedule(fresh_deadline_config):
-    """
-    A very minimal sanity check of the trace-schedule CLI command.
-    To test the function more thoroughly involves creating a mock
-    set of APIs that return a coherent set of data based on the query
-    IDs instead of single mocked returns as this test does.
-    """
-
-    with patch.object(api._session, "get_boto3_session") as session_mock:
-        deadline_mock = session_mock().client("deadline")
-        deadline_mock.get_job.return_value = MOCK_JOBS_LIST[0]
-        deadline_mock.list_sessions.return_value = {"sessions": MOCK_SESSIONS_LIST}
-        deadline_mock.list_session_actions.return_value = {
-            "sessionActions": MOCK_SESSION_ACTIONS_LIST
-        }
-        deadline_mock.get_step.return_value = MOCK_STEP
-        deadline_mock.get_task.return_value = MOCK_TASK
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "job",
-                "trace-schedule",
-                "--farm-id",
-                MOCK_FARM_ID,
-                "--queue-id",
-                MOCK_QUEUE_ID,
-                "--job-id",
-                str(MOCK_JOBS_LIST[0]["jobId"]),
-            ],
-        )
-
-        assert (
-            result.output
-            == """Getting the job...
-Getting all the sessions for the job...
-Getting all the session actions for the job...
-Getting all the steps and tasks for the job...
-Processing the trace data...
-
- ==== SUMMARY ====
-
-Session Count: 1
-Session Total Duration: 0:01:00
-Session Action Count: 1
-Session Action Total Duration: 0:00:30
-Task Run Count: 1
-Task Run Total Duration: 0:00:30 (50.0%)
-Non-Task Run Count: 0
-Non-Task Run Total Duration: 0:00:00 (0.0%)
-Sync Job Attachments Count: 0
-Sync Job Attachments Total Duration: 0:00:00 (0.0%)
-Env Action Count: 0
-Env Action Total Duration: 0:00:00 (0.0%)
-
-Within-session Overhead Duration: 0:00:30 (50.0%)
-Within-session Overhead Duration Per Action: 0:00:30
-"""
-        )
-        assert result.exit_code == 0
-
-
 @pytest.mark.usefixtures("fresh_deadline_config")
-def test_cli_job_download_output_with_different_asset_root_path_format_than_job(tmp_path: Path):
+def test_cli_job_download_output_with_different_asset_root_path_format_than_job(
+    tmp_path: Path,
+):
     """
     Tests whether the output messages printed to stdout match expected messages
     when `download-output` command is executed.
@@ -1493,12 +1430,16 @@ def test_cli_job_download_output_with_different_asset_root_path_format_than_job(
             processed_files=3,
             processed_bytes=1024,
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
+        MockOutputDownloader.return_value.download = mock_download
         windows_root_path = "C:\\Users\\username"
         not_windows_root_path = "/root/path"
         mock_root_path = not_windows_root_path if sys.platform == "win32" else windows_root_path
-        mock_files_list = ["outputs/file1.txt", "outputs/file2.txt", "outputs/file3.txt"]
-        MockOutputDownloader.return_value.get_output_paths_by_root.side_effect = [
+        mock_files_list = [
+            "outputs/file1.txt",
+            "outputs/file2.txt",
+            "outputs/file3.txt",
+        ]
+        MockOutputDownloader.return_value.get_paths_by_root.side_effect = [
             {
                 f"{mock_root_path}": mock_files_list,
             },
@@ -1539,6 +1480,7 @@ def test_cli_job_download_output_with_different_asset_root_path_format_than_job(
             task_id=None,
             session_action_id=None,
             session=ANY,
+            include_filters=None,
         )
 
         path_separator = "/" if sys.platform != "win32" else "\\"
@@ -1587,7 +1529,9 @@ class TestJsonLineHelpers:
     def test_get_json_line_with_kwargs(self):
         """Test _get_json_line with additional properties."""
         result = _get_json_line(
-            "summary", "Downloaded 5 files", extra_properties={"fileCount": 5, "status": "complete"}
+            "summary",
+            "Downloaded 5 files",
+            extra_properties={"fileCount": 5, "status": "complete"},
         )
         parsed = json.loads(result)
 
@@ -1616,6 +1560,11 @@ class TestJsonLineHelpers:
         summary.total_time = 2.5
         summary.transfer_rate = 409.6
         summary.file_counts_by_root_directory = {"/downloads": 3}
+        summary.downloaded_files = [
+            "/downloads/file1.txt",
+            "/downloads/file2.txt",
+            "/downloads/file3.txt",
+        ]
 
         result = _get_download_summary_message(summary, is_json_format=True)
         parsed = json.loads(result)
@@ -1623,6 +1572,11 @@ class TestJsonLineHelpers:
         assert parsed["messageType"] == "summary"
         assert parsed["value"] == "Downloaded 3 files"
         assert parsed["fileCount"] == 3
+        assert parsed["files"] == [
+            "/downloads/file1.txt",
+            "/downloads/file2.txt",
+            "/downloads/file3.txt",
+        ]
 
     def test_get_download_summary_message_json_zero_files(self):
         """Test _get_download_summary_message with zero files."""
@@ -1630,6 +1584,7 @@ class TestJsonLineHelpers:
 
         summary = DownloadSummaryStatistics()
         summary.processed_files = 0
+        summary.downloaded_files = []
 
         result = _get_download_summary_message(summary, is_json_format=True)
         parsed = json.loads(result)
@@ -1637,6 +1592,39 @@ class TestJsonLineHelpers:
         assert parsed["messageType"] == "summary"
         assert parsed["value"] == "Downloaded 0 files"
         assert parsed["fileCount"] == 0
+        assert parsed["files"] == []
+
+    def test_get_download_summary_message_json_with_files_list(self):
+        """Test _get_download_summary_message includes files list in JSON format."""
+        from deadline.job_attachments.progress_tracker import DownloadSummaryStatistics
+
+        summary = DownloadSummaryStatistics()
+        summary.processed_files = 5
+        summary.processed_bytes = 2048
+        summary.total_time = 3.0
+        summary.transfer_rate = 682.67
+        summary.file_counts_by_root_directory = {"/downloads": 3, "/output": 2}
+        summary.downloaded_files = [
+            "/downloads/file1.txt",
+            "/downloads/file2.txt",
+            "/downloads/subdir/file3.txt",
+            "/output/result1.png",
+            "/output/result2.png",
+        ]
+
+        result = _get_download_summary_message(summary, is_json_format=True)
+        parsed = json.loads(result)
+
+        assert parsed["messageType"] == "summary"
+        assert parsed["value"] == "Downloaded 5 files"
+        assert parsed["fileCount"] == 5
+        assert parsed["files"] == [
+            "/downloads/file1.txt",
+            "/downloads/file2.txt",
+            "/downloads/subdir/file3.txt",
+            "/output/result1.png",
+            "/output/result2.png",
+        ]
 
     def test_get_download_summary_message_non_json_unchanged(self):
         """Test _get_download_summary_message non-JSON format is unchanged."""
@@ -1673,8 +1661,8 @@ def test_cli_job_download_output_with_session_action_id(fresh_deadline_config):
             processed_files=3,
             processed_bytes=1024,
         )
-        MockOutputDownloader.return_value.download_job_output = mock_download
-        MockOutputDownloader.return_value.get_output_paths_by_root.return_value = {}
+        MockOutputDownloader.return_value.download = mock_download
+        MockOutputDownloader.return_value.get_paths_by_root.return_value = {}
 
         mock_host_path_format_name = PathFormat.get_host_path_format_string()
         boto3_client_mock().get_job.return_value = {
@@ -1724,4 +1712,474 @@ def test_cli_job_download_output_with_session_action_id(fresh_deadline_config):
             task_id=MOCK_TASK_ID,
             session_action_id=MOCK_SESSION_ACTION_ID,
             session=ANY,
+            include_filters=None,
         )
+
+
+class TestEstimateCompletionTime:
+    def test_format_duration_seconds(self):
+        assert _format_duration(30) == "30 seconds"
+
+    def test_format_duration_minutes(self):
+        assert _format_duration(120) == "2 minutes"
+        assert _format_duration(60) == "1 minute"
+
+    def test_format_duration_hours(self):
+        assert _format_duration(3600) == "1 hour"
+        assert _format_duration(5400) == "1 hour, 30 minutes"
+
+    def test_estimate_remaining_time_no_tasks(self):
+        job: dict = {"taskRunStatusCounts": {}, "startedAt": None}
+        assert _estimate_remaining_time(job) is None
+
+    def test_estimate_remaining_time_completed_job(self):
+        job = {
+            "taskRunStatusCounts": {"SUCCEEDED": 10, "RUNNING": 0, "READY": 0},
+            "startedAt": datetime.datetime.now(timezone.utc),
+        }
+        assert _estimate_remaining_time(job) is None
+
+
+def test_cli_job_list_with_estimates(fresh_deadline_config, deadline_mock):
+    """
+    Confirm that the CLI interface prints estimated time remaining
+    for in-progress jobs.
+    """
+    config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+    config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+
+    mock_job_with_task_counts = {
+        "jobId": "job-aaf4cdf8aae242f58fb84c5bb19f199b",
+        "name": "CLI Job",
+        "taskRunStatus": "RUNNING",
+        "lifecycleStatus": "CREATE_COMPLETE",
+        "createdBy": "b801f3c0-c071-70bc-b869-6804bc732408",
+        "createdAt": datetime.datetime(2023, 1, 27, 7, 34, 41, tzinfo=tzutc()),
+        "startedAt": datetime.datetime(2023, 1, 27, 7, 37, 53, tzinfo=tzutc()),
+        "priority": 50,
+        "taskRunStatusCounts": {
+            "SUCCEEDED": 5,
+            "RUNNING": 2,
+            "READY": 3,
+        },
+    }
+
+    deadline_mock.search_jobs.return_value = {
+        "jobs": [mock_job_with_task_counts],
+        "totalResults": 1,
+        "itemOffset": 1,
+    }
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["job", "list"])
+
+    assert result.exit_code == 0
+    assert "estimatedTimeRemaining:" in result.output
+
+
+# ─── download-input tests ──────────────────────────────────────────────────────
+
+
+class TestBuildAttachments:
+    """Tests for the _build_attachments helper."""
+
+    def test_returns_none_when_no_attachments(self):
+        from deadline.client.cli._groups.job_group import _build_attachments
+
+        assert _build_attachments({"name": "job"}) is None
+
+    def test_returns_none_when_attachments_empty(self):
+        from deadline.client.cli._groups.job_group import _build_attachments
+
+        assert _build_attachments({"attachments": {}}) is None
+
+    def test_builds_attachments_from_job(self):
+        from deadline.client.cli._groups.job_group import _build_attachments
+
+        job = {
+            "attachments": {
+                "manifests": [
+                    {
+                        "rootPath": "/root",
+                        "rootPathFormat": "posix",
+                        "inputManifestPath": "manifest",
+                        "inputManifestHash": "abc123",
+                    }
+                ],
+                "fileSystem": "COPIED",
+            }
+        }
+        result = _build_attachments(job)
+        assert result is not None
+        assert len(result.manifests) == 1
+        assert result.manifests[0].rootPath == "/root"
+        assert result.fileSystem == "COPIED"
+
+    def test_defaults_filesystem_to_copied(self):
+        from deadline.client.cli._groups.job_group import _build_attachments
+
+        job = {
+            "attachments": {
+                "manifests": [
+                    {
+                        "rootPath": "/root",
+                        "rootPathFormat": "posix",
+                        "inputManifestPath": "manifest",
+                        "inputManifestHash": "abc123",
+                    }
+                ],
+            }
+        }
+        result = _build_attachments(job)
+        assert result is not None
+        assert result.fileSystem == "COPIED"
+
+
+class TestJobDownloadInput:
+    """Tests for the download-input CLI command."""
+
+    MOCK_HOST_PATH_FORMAT = PathFormat.get_host_path_format()
+    MOCK_ROOT_PATH = "/root/path" if sys.platform != "win32" else "C:\\Users\\username"
+    MOCK_FILES_LIST = ["inputs/file1.txt", "inputs/file2.txt"]
+
+    def _make_job_response(self, root_path=None, path_format=None):
+        root_path = root_path or self.MOCK_ROOT_PATH
+        path_format = path_format or self.MOCK_HOST_PATH_FORMAT
+        return {
+            "name": "Mock Job",
+            "attachments": {
+                "manifests": [
+                    {
+                        "rootPath": root_path,
+                        "rootPathFormat": path_format,
+                        "inputManifestPath": "manifest-hash",
+                        "inputManifestHash": "abc123",
+                    }
+                ],
+                "fileSystem": "COPIED",
+            },
+        }
+
+    def _setup_mocks(self, boto3_mock, input_downloader_mock, paths_by_root=None):
+        mock_download = MagicMock()
+        mock_download.return_value = DownloadSummaryStatistics(
+            total_time=5, processed_files=2, processed_bytes=512
+        )
+        input_downloader_mock.return_value.download = mock_download
+        if paths_by_root is None:
+            paths_by_root = {self.MOCK_ROOT_PATH: self.MOCK_FILES_LIST}
+        input_downloader_mock.return_value.get_paths_by_root.return_value = paths_by_root
+        boto3_mock().get_queue.return_value = MOCK_GET_QUEUE_RESPONSE
+        boto3_mock().get_job.return_value = self._make_job_response()
+
+    def test_download_input_basic(self, fresh_deadline_config):
+        """Basic download-input with auto-accept."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+        config.set_setting("settings.auto_accept", "true")
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"):
+            self._setup_mocks(boto3_mock, mock_downloader)
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID],
+            )
+
+            assert result.exit_code == 0
+            assert "Downloading input for Job" in result.output
+            assert "Download Summary:" in result.output
+            mock_downloader.return_value.download.assert_called_once()
+
+    def test_download_input_no_attachments(self, fresh_deadline_config):
+        """download-input with a job that has no attachments."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+
+        with patch.object(api, "get_boto3_client") as boto3_mock:
+            boto3_mock().get_job.return_value = {"name": "Mock Job"}
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID],
+            )
+
+            assert result.exit_code == 0
+            assert "No input attachments found" in result.output
+
+    def test_download_input_no_files(self, fresh_deadline_config):
+        """download-input when downloader returns empty paths."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(api, "get_queue_user_boto3_session"):
+            self._setup_mocks(boto3_mock, mock_downloader, paths_by_root={})
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID],
+            )
+
+            assert result.exit_code == 0
+            assert "No input files available for download" in result.output
+
+    def test_download_input_cancel(self, fresh_deadline_config):
+        """download-input cancelled by user."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"):
+            self._setup_mocks(boto3_mock, mock_downloader)
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID],
+                input="n\n",
+            )
+
+            assert result.exit_code == 0
+            assert "Input download canceled" in result.output
+            mock_downloader.return_value.download.assert_not_called()
+
+    def test_download_input_json_format(self, fresh_deadline_config):
+        """download-input with JSON output format."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+        config.set_setting("settings.auto_accept", "true")
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"):
+            self._setup_mocks(boto3_mock, mock_downloader)
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID, "--output", "json"],
+            )
+
+            assert result.exit_code == 0
+            # JSON output should contain title line
+            lines = result.output.strip().split("\n")
+            title_line = json.loads(lines[0])
+            assert title_line["messageType"] == "title"
+            assert title_line["value"] == "Mock Job"
+
+    def test_download_input_with_include_filter(self, fresh_deadline_config):
+        """download-input with --include filter uses LOCAL matching by default."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+        config.set_setting("settings.auto_accept", "true")
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"):
+            self._setup_mocks(boto3_mock, mock_downloader)
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                [
+                    "job",
+                    "download-input",
+                    "--job-id",
+                    MOCK_JOB_ID,
+                    "--include",
+                    "*.txt",
+                ],
+            )
+
+            assert result.exit_code == 0
+            # InputDownloader should be created without include_filters (LOCAL mode)
+            mock_downloader.assert_called_once()
+            call_kwargs = mock_downloader.call_args[1]
+            assert call_kwargs["include_filters"] is None
+            # apply_include_filters should be called for LOCAL matching
+            mock_downloader.return_value.apply_include_filters.assert_called_once_with(["*.txt"])
+
+    def test_download_input_with_match_paths_by_job(self, fresh_deadline_config):
+        """download-input with --match-paths-by JOB passes filters to constructor."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+        config.set_setting("settings.auto_accept", "true")
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"):
+            self._setup_mocks(boto3_mock, mock_downloader)
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                [
+                    "job",
+                    "download-input",
+                    "--job-id",
+                    MOCK_JOB_ID,
+                    "--include",
+                    "*.txt",
+                    "--match-paths-by",
+                    "JOB",
+                ],
+            )
+
+            assert result.exit_code == 0
+            # InputDownloader should be created WITH include_filters (JOB mode)
+            call_kwargs = mock_downloader.call_args[1]
+            assert call_kwargs["include_filters"] == ["*.txt"]
+
+    def test_download_input_mismatching_path_format(self, fresh_deadline_config, tmp_path):
+        """download-input prompts for new root when OS format doesn't match."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+
+        # Use the opposite OS path format
+        mock_root_path = "C:\\Users\\username" if sys.platform != "win32" else "/root/path"
+        current_format = PathFormat.get_host_path_format()
+        other_format = (
+            PathFormat.WINDOWS if current_format == PathFormat.POSIX else PathFormat.POSIX
+        )
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"):
+            mock_download = MagicMock()
+            mock_download.return_value = DownloadSummaryStatistics(
+                total_time=5, processed_files=1, processed_bytes=256
+            )
+            mock_downloader.return_value.download = mock_download
+            mock_downloader.return_value.get_paths_by_root.side_effect = [
+                {mock_root_path: ["file.txt"]},
+                {str(tmp_path): ["file.txt"]},
+                {str(tmp_path): ["file.txt"]},
+            ]
+            boto3_mock().get_queue.return_value = MOCK_GET_QUEUE_RESPONSE
+            boto3_mock().get_job.return_value = {
+                "name": "Mock Job",
+                "attachments": {
+                    "manifests": [
+                        {
+                            "rootPath": mock_root_path,
+                            "rootPathFormat": other_format,
+                            "inputManifestPath": "manifest",
+                            "inputManifestHash": "abc123",
+                        }
+                    ],
+                    "fileSystem": "COPIED",
+                },
+            }
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID],
+                input=f"{str(tmp_path)}\ny\n",
+            )
+
+            assert result.exit_code == 0
+            assert "does not match the operating system" in result.output
+            mock_downloader.return_value.set_root_path.assert_called_once_with(
+                mock_root_path, str(tmp_path)
+            )
+
+    def test_download_input_storage_profile_mapping(self, fresh_deadline_config):
+        """download-input applies storage profile path mapping via set_root_path."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+        config.set_setting("settings.auto_accept", "true")
+
+        mock_root = "/original/root"
+        mapped_root = "/mapped/root"
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"), patch.object(
+            job_group, "_resolve_storage_profiles"
+        ) as mock_resolve, patch.object(
+            job_group, "_generate_path_mapping_rules"
+        ) as mock_gen_rules, patch.object(job_group, "_PathMappingRuleApplier") as mock_applier_cls:
+            mock_download = MagicMock()
+            mock_download.return_value = DownloadSummaryStatistics(
+                total_time=5, processed_files=1, processed_bytes=256
+            )
+            mock_downloader.return_value.download = mock_download
+            mock_downloader.return_value.get_paths_by_root.return_value = {mock_root: ["file.txt"]}
+            boto3_mock().get_queue.return_value = MOCK_GET_QUEUE_RESPONSE
+            boto3_mock().get_job.return_value = self._make_job_response(root_path=mock_root)
+
+            # Set up storage profile resolution
+            mock_resolved = MagicMock()
+            mock_resolved.local_profile.displayName = "TestProfile"
+            mock_resolve.return_value = mock_resolved
+            mock_gen_rules.return_value = [MagicMock()]  # non-empty rules
+
+            # Applier maps original root to mapped root
+            mock_applier = MagicMock()
+            mock_applier.strict_transform.return_value = mapped_root
+            mock_applier_cls.return_value = mock_applier
+
+            runner = CliRunner()
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID],
+            )
+
+            assert result.exit_code == 0
+            assert "Using storage profile: TestProfile" in result.output
+            mock_downloader.return_value.set_root_path.assert_called_once_with(
+                mock_root, mapped_root
+            )
+
+    def test_download_input_edit_root_path(self, fresh_deadline_config, tmp_path):
+        """download-input allows editing root paths in the confirmation prompt."""
+        config.set_setting("defaults.farm_id", MOCK_FARM_ID)
+        config.set_setting("defaults.queue_id", MOCK_QUEUE_ID)
+
+        with patch.object(api, "get_boto3_client") as boto3_mock, patch.object(
+            job_group, "InputDownloader"
+        ) as mock_downloader, patch.object(
+            job_group, "_get_conflicting_filenames", return_value=[]
+        ), patch.object(api, "get_queue_user_boto3_session"):
+            self._setup_mocks(boto3_mock, mock_downloader)
+            # Return different paths after set_root_path is called
+            mock_downloader.return_value.get_paths_by_root.side_effect = [
+                {self.MOCK_ROOT_PATH: self.MOCK_FILES_LIST},
+                {str(tmp_path): self.MOCK_FILES_LIST},
+                {str(tmp_path): self.MOCK_FILES_LIST},
+            ]
+
+            runner = CliRunner()
+            # Select index 0 to edit, enter new path, then confirm with y
+            result = runner.invoke(
+                main,
+                ["job", "download-input", "--job-id", MOCK_JOB_ID],
+                input=f"0\n{str(tmp_path)}\ny\n",
+            )
+
+            assert result.exit_code == 0
+            mock_downloader.return_value.set_root_path.assert_called()
+            assert "Download Summary:" in result.output

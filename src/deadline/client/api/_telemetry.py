@@ -11,7 +11,7 @@ import random
 import sys
 import time
 
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.config import Config as BotocoreConfig
 from configparser import ConfigParser
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -28,16 +28,34 @@ from ._session import (
     get_boto3_client,
     get_boto3_session,
 )
+from ._stack_trace_sanitizer import sanitize_exception
 from ..config import config_file
 from .. import version
 
-__cached_telemetry_client = None
+__cached_telemetry_clients: Dict[str, "TelemetryClient"] = {}
 
 logger = logging.getLogger(__name__)
 
 
 # Generic function return type.
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _swallow_exceptions(func: F) -> F:
+    """Decorator that catches all exceptions in telemetry functions to prevent
+    telemetry issues from affecting the main application flow."""
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            logger.debug(
+                "Swallowed exception in telemetry function %s", func.__name__, exc_info=True
+            )
+            return None
+
+    return cast(F, wrapper)
 
 
 def get_deadline_endpoint_url(
@@ -87,29 +105,41 @@ class TelemetryClient:
 
     ENDPOINT_PREFIX = "management."
 
-    _common_details: Dict[str, Any] = {}
-    _system_metadata: Dict[str, Any] = {}
-
     def __init__(
         self,
         package_name: str,
         package_ver: str,
         config: Optional[ConfigParser] = None,
     ):
+        # Instance-level dicts so every TelemetryClient has its own state (avoid
+        # the mutable-class-attribute pitfall where updates would be shared by
+        # all instances).
+        self._common_details: Dict[str, Any] = {}
+        self._system_metadata: Dict[str, Any] = {}
+
         self._initialized: bool = False
         self.package_name = package_name
         self.package_ver = ".".join(package_ver.split(".")[:3])
 
         # IDs for this session
         self.session_id: str = str(uuid.uuid4())
-        self.telemetry_id: str = self._get_telemetry_identifier(config=config)
+        try:
+            self.telemetry_id: str = self._get_telemetry_identifier(config=config)
+        except Exception:
+            logger.debug("Swallowed exception in telemetry __init__", exc_info=True)
+            self.telemetry_id = str(uuid.uuid4())
         # If a different base package is provided, include info from this library as supplementary info
         if package_name != "deadline-cloud-library":
             self._common_details["deadline-cloud-version"] = version
-        self._system_metadata = self._get_system_metadata(config=config)
+        try:
+            self._system_metadata = self._get_system_metadata(config=config)
+        except Exception:
+            logger.debug("Swallowed exception in telemetry __init__", exc_info=True)
+            self._system_metadata = {}
         self.set_opt_out(config=config)
         self.initialize(config=config)
 
+    @_swallow_exceptions
     def set_opt_out(self, config: Optional[ConfigParser] = None) -> None:
         """
         Checks whether telemetry has been opted out by checking the DEADLINE_CLOUD_TELEMETRY_OPT_OUT
@@ -128,6 +158,7 @@ class TelemetryClient:
             + ("not enabled." if self.telemetry_opted_out else "enabled.")
         )
 
+    @_swallow_exceptions
     def initialize(self, config: Optional[ConfigParser] = None) -> None:
         """
         Starts up the telemetry background thread after getting settings from the boto3 client.
@@ -138,31 +169,48 @@ class TelemetryClient:
         if self.telemetry_opted_out:
             return
 
-        try:
-            self.endpoint: str = self._get_prefixed_endpoint(
-                f"{get_deadline_endpoint_url(config=config)}/2023-10-12/telemetry",
-                TelemetryClient.ENDPOINT_PREFIX,
-            )
+        self.endpoint: str = self._get_prefixed_endpoint(
+            f"{get_deadline_endpoint_url(config=config)}/2023-10-12/telemetry",
+            TelemetryClient.ENDPOINT_PREFIX,
+        )
 
-            # Some environments might not have SSL, so we'll use the vendored botocore SSL context
-            from botocore.httpsession import create_urllib3_context, get_cert_path
+        # Some environments might not have SSL, so we'll use the vendored botocore SSL context
+        from botocore.httpsession import create_urllib3_context, get_cert_path
 
-            self._urllib3_context = create_urllib3_context()
-            self._urllib3_context.load_verify_locations(cafile=get_cert_path(True))
+        self._urllib3_context = create_urllib3_context()
+        self._urllib3_context.load_verify_locations(cafile=get_cert_path(True))
 
-            user_id, _ = get_user_and_identity_store_id(config=config)
-            if user_id:
-                self._system_metadata["user_id"] = user_id
+        user_id, _ = get_user_and_identity_store_id(config=config)
+        if user_id:
+            self._system_metadata["user_id"] = user_id
 
-            monitor_id: Optional[str] = get_monitor_id(config=config)
-            if monitor_id:
-                self._system_metadata["monitor_id"] = monitor_id
+        monitor_id: Optional[str] = get_monitor_id(config=config)
+        if monitor_id:
+            self._system_metadata["monitor_id"] = monitor_id
 
-            self._initialized = True
-            self._start_threads()
-        except Exception:
-            # Silently swallow any exceptions
-            return
+        self._initialized = True
+        self._start_threads()
+
+    def record_error_with_trace(
+        self,
+        exc: BaseException,
+        exception_scope: str,
+        extra_details: Optional[dict] = None,
+        from_gui: bool = False,
+    ) -> None:
+        event_details: dict = {
+            "exception_type": type(exc).__qualname__,
+            "exception_scope": exception_scope,
+            "stack_trace": sanitize_exception(exc),
+        }
+        if extra_details:
+            event_details.update(extra_details)
+
+        self.record_event(
+            event_type="com.amazon.rum.deadline.error",
+            event_details=event_details,
+            from_gui=from_gui,
+        )
 
     @property
     def is_initialized(self) -> bool:
@@ -212,8 +260,15 @@ class TelemetryClient:
 
         return metadata
 
+    @_swallow_exceptions
     def _exit_cleanly(self):
-        self.event_queue.put(None)
+        try:
+            self.event_queue.put_nowait(None)
+        except Full:
+            # If the queue is full, it may mean the telemetry processing thread has already joined
+            # since it is daemon and the Python runtime will shut it down on exit.
+            # Ignore the error, since this is a best-effort cleanup.
+            pass
         self.processing_thread.join()
 
     def _send_request(self, req: request.Request) -> None:
@@ -245,6 +300,15 @@ class TelemetryClient:
 
     def _process_event_queue_thread(self):
         """Background thread for processing the telemetry event data queue and sending telemetry requests."""
+        # Resolve the AWS account ID once on this background thread so callers
+        # of record_event() are never blocked (e.g. by a slow STS timeout on a
+        # restricted network). The resolved value is stored on _common_details
+        # and merged into every event's payload below, so events enqueued
+        # before resolution completes still include the account ID when sent.
+        account_id = self.get_account_id(get_boto3_session())
+        if account_id:
+            self.update_common_details({"accountId": account_id})
+
         while True:
             # Blocks until we get a new entry in the queue
             event_data: Optional[TelemetryEvent] = self.event_queue.get()
@@ -254,11 +318,15 @@ class TelemetryClient:
 
             headers = {"Accept": "application-json", "Content-Type": "application-json"}
             try:
+                # Merge _common_details into the per-event details at send
+                # time (not enqueue time) so late-resolved fields like
+                # accountId are included.
+                details = {**event_data.event_details, **self._common_details}
                 request_body = {
                     "BatchId": str(uuid.uuid4()),
                     "RumEvents": [
                         {
-                            "details": str(json.dumps(event_data.event_details)),
+                            "details": str(json.dumps(details)),
                             "id": str(uuid.uuid4()),
                             "metadata": str(json.dumps(self._system_metadata)),
                             "timestamp": int(datetime.now().timestamp()),
@@ -291,6 +359,11 @@ class TelemetryClient:
             # Silently swallow the error if the event queue is full (due to throttling of the service)
             pass
 
+    def record_vfs_mounting(self, successfully_mounted: bool):
+        details: Dict[str, Any] = {"successfully_mounted": successfully_mounted}
+        event_type = "com.amazon.rum.deadline.job_attachments.vfs_mount"
+        self.record_event(event_type=event_type, event_details=details, from_gui=False)
+
     def _record_summary_statistics(
         self, event_type: str, summary: SummaryStatistics, from_gui: bool
     ):
@@ -314,16 +387,10 @@ class TelemetryClient:
         # Possibility to add stack trace here
         self.record_event("com.amazon.rum.deadline.error", event_details, from_gui=from_gui)
 
+    @_swallow_exceptions
     def record_event(
         self, event_type: str, event_details: Dict[str, Any], *, from_gui: bool = False
     ):
-        try:
-            self.update_common_details({"accountId": self.get_account_id(get_boto3_session())})
-        except Exception as e:
-            # Print any errors when getting the boto3 session, then proceed
-            logger.debug(f"Could not add account ID to telemetry: {str(e)}")
-
-        event_details.update(self._common_details)
         event_details["usage_mode"] = "GUI" if from_gui else "CLI"
         self._put_telemetry_record(
             TelemetryEvent(
@@ -334,15 +401,36 @@ class TelemetryClient:
 
     @lru_cache
     def get_account_id(self, boto3_session) -> Optional[str]:
-        """
-        Retrieves the AWS account ID for the current user.
+        """Best-effort AWS account ID lookup for telemetry, cached per
+        (client, session) so it runs at most once per telemetry client
+        instance.
 
-        If the user is not authenticated, print an error message
+        Prefers ``session.get_credentials().account_id`` (populated for free
+        by SSO, AssumeRole, IMDS/ECS, or a ``credential_process`` that emits
+        ``AccountId``). Deadline Cloud monitor delivers its credentials
+        through ``credential_process`` (see ``_get_boto3_session_for_profile``
+        in ``_session.py``), so if DCM's process output includes
+        ``AccountId`` this fast path covers the common monitor user flow
+        without an STS call. Falls back to ``sts:GetCallerIdentity`` with a
+        short timeout, returning ``None`` on any failure so users on
+        restricted networks without STS access can still run the CLI.
         """
         try:
-            return boto3_session.client("sts").get_caller_identity()["Account"]
-        except (ClientError, NoCredentialsError) as e:
-            print(f"Could not add account ID to telemetry: {str(e)}")
+            credentials = boto3_session.get_credentials()
+            account_id = getattr(credentials, "account_id", None) if credentials else None
+            if account_id:
+                return account_id
+            # Short-timeout best-effort fallback; runs on the telemetry background
+            # thread so blocking is fine.
+            sts = boto3_session.client(
+                "sts",
+                config=BotocoreConfig(
+                    connect_timeout=2, read_timeout=2, retries={"max_attempts": 1}
+                ),
+            )
+            return sts.get_caller_identity()["Account"]
+        except Exception:
+            logger.debug("Could not resolve account ID for telemetry", exc_info=True)
             return None
 
     def update_common_details(self, details: Dict[str, Any]):
@@ -360,17 +448,19 @@ def get_telemetry_client(
     :param config: Optional configuration to use for the client. Loads defaults if not given.
     :return: Telemetry client to make requests with.
     """
-    global __cached_telemetry_client
-    if not __cached_telemetry_client:
-        __cached_telemetry_client = TelemetryClient(
+    global __cached_telemetry_clients
+    cached = __cached_telemetry_clients.get(package_name)
+    if not cached:
+        cached = TelemetryClient(
             package_name=package_name,
             package_ver=package_ver,
             config=config,
         )
-    elif not __cached_telemetry_client.is_initialized:
-        __cached_telemetry_client.initialize(config=config)
+        __cached_telemetry_clients[package_name] = cached
+    elif not cached.is_initialized:
+        cached.initialize(config=config)
 
-    return __cached_telemetry_client
+    return cached
 
 
 def get_deadline_cloud_library_telemetry_client(

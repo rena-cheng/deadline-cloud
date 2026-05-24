@@ -21,14 +21,20 @@ def test_cli_deadline_cloud_monitor_login_and_logout(fresh_deadline_config):
     """
     Confirm that the CLI login/logout command invokes Deadline Cloud monitor as expected
     """
+    if sys.platform.startswith("win"):
+        dcm = "C:/Programs/bin/DeadlineCloudMonitor"
+    else:
+        dcm = "/bin/DeadlineCloudMonitor"
     scoped_config = {
-        "credential_process": "/bin/DeadlineCloudMonitor get-credentials --profile sandbox-us-west-2",
+        "credential_process": f"{dcm} get-credentials --profile sandbox-us-west-2",
         "monitor_id": "monitor-1g9neezauta8ease",
         "region": "us-west-2",
+        "user_id": "user-1234",
+        "identity_store_id": "d-abcdef0123",
     }
 
     profile_name = "sandbox-us-west-2"
-    config.set_setting("deadline-cloud-monitor.path", "/bin/DeadlineCloudMonitor")
+    config.set_setting("deadline-cloud-monitor.path", dcm)
     config.set_setting("defaults.aws_profile_name", profile_name)
 
     with patch.object(api._session, "get_boto3_session") as session_mock, patch.object(
@@ -54,7 +60,12 @@ def test_cli_deadline_cloud_monitor_login_and_logout(fresh_deadline_config):
 
         if sys.platform.startswith("win"):
             popen_mock.assert_called_once_with(
-                ["/bin/DeadlineCloudMonitor", "login", "--profile", "sandbox-us-west-2"],
+                [
+                    "C:\\Programs\\bin\\DeadlineCloudMonitor",
+                    "login",
+                    "--profile",
+                    "sandbox-us-west-2",
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.PIPE,
@@ -79,9 +90,19 @@ def test_cli_deadline_cloud_monitor_login_and_logout(fresh_deadline_config):
         runner = CliRunner()
         result = runner.invoke(main, ["auth", "logout"])
 
-        check_output_mock.assert_called_once_with(
-            ["/bin/DeadlineCloudMonitor", "logout", "--profile", "sandbox-us-west-2"]
-        )
+        if sys.platform.startswith("win"):
+            check_output_mock.assert_called_once_with(
+                [
+                    "C:\\Programs\\bin\\DeadlineCloudMonitor",
+                    "logout",
+                    "--profile",
+                    "sandbox-us-west-2",
+                ]
+            )
+        else:
+            check_output_mock.assert_called_once_with(
+                ["/bin/DeadlineCloudMonitor", "logout", "--profile", "sandbox-us-west-2"]
+            )
 
         assert "Successfully logged out" in result.output
         mock_profile_session_cache_clear.assert_called()
@@ -130,12 +151,16 @@ def test_cli_auth_status_json(fresh_deadline_config):
         "credential_process": "/bin/DeadlineCloudMonitor get-credentials --profile sandbox-us-west-2",
         "monitor_id": "monitor-1g9neezauta8ease",
         "region": "us-west-2",
+        "user_id": "user-1234",
+        "identity_store_id": "d-abcdef0123",
     }
     config.set_setting("defaults.aws_profile_name", profile_name)
 
     with patch.object(api._session, "get_boto3_session") as session_mock, patch.object(
         api, "get_boto3_session", new=session_mock
-    ):
+    ), patch.object(
+        api, "check_authentication_status", return_value=api.AwsAuthenticationStatus.AUTHENTICATED
+    ), patch.object(api, "check_deadline_api_available", return_value=False):
         # The profile name
         session_mock().profile_name = profile_name
         # This configuration includes the IdC profile
